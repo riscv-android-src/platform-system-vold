@@ -24,16 +24,23 @@ namespace vold {
 
 // Represents the information needed to decrypt a disk encryption key.
 // If "token" is nonempty, it is passed in as a required Gatekeeper auth token.
-// If "secret" is nonempty, it is appended to the application-specific
+// If "token" and "secret" are nonempty, "secret" is appended to the application-specific
 // binary needed to unlock.
+// If only "secret" is nonempty, it is used to decrypt in a non-Keymaster process.
 class KeyAuthentication {
   public:
     KeyAuthentication(std::string t, std::string s) : token{t}, secret{s} {};
+
+    bool usesKeymaster() const { return !token.empty() || secret.empty(); };
+
     const std::string token;
     const std::string secret;
 };
 
 extern const KeyAuthentication kEmptyAuthentication;
+
+// Checks if path "path" exists.
+bool pathExists(const std::string& path);
 
 // Create a directory at the named path, and store "key" in it,
 // in such a way that it can only be retrieved via Keymaster and
@@ -41,12 +48,20 @@ extern const KeyAuthentication kEmptyAuthentication;
 // It's safe to move/rename the directory after creation.
 bool storeKey(const std::string& dir, const KeyAuthentication& auth, const std::string& key);
 
+// Create a directory at the named path, and store "key" in it as storeKey
+// This version creates the key in "tmp_path" then atomically renames "tmp_path"
+// to "key_path" thereby ensuring that the key is either stored entirely or
+// not at all.
+bool storeKeyAtomically(const std::string& key_path, const std::string& tmp_path,
+                        const KeyAuthentication& auth, const std::string& key);
+
 // Retrieve the key from the named directory.
 bool retrieveKey(const std::string& dir, const KeyAuthentication& auth, std::string* key);
 
 // Securely destroy the key stored in the named directory and delete the directory.
 bool destroyKey(const std::string& dir);
 
+bool runSecdiscardSingle(const std::string& file);
 }  // namespace vold
 }  // namespace android
 

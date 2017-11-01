@@ -14,10 +14,9 @@ common_src_files := \
 	Loop.cpp \
 	Devmapper.cpp \
 	ResponseCode.cpp \
-	CheckBattery.cpp \
 	Ext4Crypt.cpp \
 	VoldUtil.c \
-	cryptfs.c \
+	cryptfs.cpp \
 	Disk.cpp \
 	VolumeBase.cpp \
 	PublicVolume.cpp \
@@ -29,21 +28,24 @@ common_src_files := \
 	TrimTask.cpp \
 	Keymaster.cpp \
 	KeyStorage.cpp \
+	KeyUtil.cpp \
 	ScryptParameters.cpp \
 	secontext.cpp \
+	EncryptInplace.cpp \
+	MetadataCrypt.cpp \
 
 common_c_includes := \
 	system/extras/f2fs_utils \
 	external/scrypt/lib/crypto \
+	external/f2fs-tools/include \
 	frameworks/native/include \
 	system/security/keystore \
-	hardware/libhardware/include/hardware \
-	system/security/softkeymaster/include/keymaster
 
 common_shared_libraries := \
 	libsysutils \
 	libbinder \
 	libcutils \
+	libkeyutils \
 	liblog \
 	libdiskconfig \
 	libhardware_legacy \
@@ -55,9 +57,11 @@ common_shared_libraries := \
 	libselinux \
 	libutils \
 	libhardware \
-	libsoftkeymaster \
 	libbase \
-	libkeymaster_messages \
+	libhwbinder \
+	libhidlbase \
+	android.hardware.keymaster@3.0 \
+	libkeystore_binder
 
 common_static_libraries := \
 	libbootloader_message \
@@ -66,7 +70,12 @@ common_static_libraries := \
 	libfec_rs \
 	libsquashfs_utils \
 	libscrypt_static \
-	libbatteryservice \
+	libavb \
+
+# TODO: include "cert-err34-c" once we move to Binder
+# TODO: include "cert-err58-cpp" once 36656327 is fixed
+common_local_tidy_flags := -warnings-as-errors=clang-analyzer-security*,cert-*
+common_local_tidy_checks := -*,clang-analyzer-security*,cert-*,-cert-err34-c,-cert-err58-cpp
 
 vold_conlyflags := -std=c11
 vold_cflags := -Werror -Wall -Wno-missing-field-initializers -Wno-unused-variable -Wno-unused-parameter
@@ -86,6 +95,9 @@ include $(CLEAR_VARS)
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 LOCAL_MODULE := libvold
 LOCAL_CLANG := true
+LOCAL_TIDY := true
+LOCAL_TIDY_FLAGS := $(common_local_tidy_flags)
+LOCAL_TIDY_CHECKS := $(common_local_tidy_checks)
 LOCAL_SRC_FILES := $(common_src_files)
 LOCAL_C_INCLUDES := $(common_c_includes)
 LOCAL_SHARED_LIBRARIES := $(common_shared_libraries)
@@ -102,6 +114,9 @@ include $(CLEAR_VARS)
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 LOCAL_MODULE := vold
 LOCAL_CLANG := true
+LOCAL_TIDY := true
+LOCAL_TIDY_FLAGS := $(common_local_tidy_flags)
+LOCAL_TIDY_CHECKS := $(common_local_tidy_checks)
 LOCAL_SRC_FILES := \
 	main.cpp \
 	$(common_src_files)
@@ -111,12 +126,6 @@ LOCAL_INIT_RC := vold.rc
 LOCAL_C_INCLUDES := $(common_c_includes)
 LOCAL_CFLAGS := $(vold_cflags)
 LOCAL_CONLYFLAGS := $(vold_conlyflags)
-
-ifeq ($(TARGET_HW_DISK_ENCRYPTION),true)
-LOCAL_C_INCLUDES += $(TARGET_CRYPTFS_HW_PATH)
-common_shared_libraries += libcryptfs_hw
-LOCAL_CFLAGS += -DCONFIG_HW_DISK_ENCRYPTION
-endif
 
 LOCAL_SHARED_LIBRARIES := $(common_shared_libraries)
 LOCAL_STATIC_LIBRARIES := $(common_static_libraries)
@@ -128,6 +137,9 @@ include $(CLEAR_VARS)
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 LOCAL_CLANG := true
+LOCAL_TIDY := true
+LOCAL_TIDY_FLAGS := $(common_local_tidy_flags)
+LOCAL_TIDY_CHECKS := $(common_local_tidy_checks)
 LOCAL_SRC_FILES := vdc.cpp
 LOCAL_MODULE := vdc
 LOCAL_SHARED_LIBRARIES := libcutils libbase
@@ -141,6 +153,9 @@ include $(CLEAR_VARS)
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 LOCAL_CLANG := true
+LOCAL_TIDY := true
+LOCAL_TIDY_FLAGS := $(common_local_tidy_flags)
+LOCAL_TIDY_CHECKS := $(common_local_tidy_checks)
 LOCAL_SRC_FILES:= secdiscard.cpp
 LOCAL_MODULE:= secdiscard
 LOCAL_SHARED_LIBRARIES := libbase
@@ -148,3 +163,5 @@ LOCAL_CFLAGS := $(vold_cflags)
 LOCAL_CONLYFLAGS := $(vold_conlyflags)
 
 include $(BUILD_EXECUTABLE)
+
+include $(LOCAL_PATH)/tests/Android.mk
