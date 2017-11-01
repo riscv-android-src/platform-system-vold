@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2016 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,19 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "VoldCheckBattery"
-#include <cutils/log.h>
+#ifndef _ENCRYPT_INPLACE_H
+#define _ENCRYPT_INPLACE_H
 
-#include <binder/IServiceManager.h>
-#include <batteryservice/IBatteryPropertiesRegistrar.h>
+#include <sys/types.h>
 
-using namespace android;
+#define CRYPT_INPLACE_BUFSIZE 4096
+#define CRYPT_SECTOR_SIZE 512
+#define RETRY_MOUNT_ATTEMPTS 10
+#define RETRY_MOUNT_DELAY_SECONDS 1
 
-extern "C"
-{
-    int is_battery_ok_to_start()
-    {
-      // Bug 16868177 exists to purge this code completely
-      return true; //is_battery_ok(START_THRESHOLD);
-    }
+int cryptfs_enable_inplace(char *crypto_blkdev, char *real_blkdev,
+                           off64_t size, off64_t *size_already_done,
+                           off64_t tot_size,
+                           off64_t previously_encrypted_upto);
 
-    int is_battery_ok_to_continue()
-    {
-      // Bug 16868177 exists to purge this code completely
-      return true; //is_battery_ok(CONTINUE_THRESHOLD);
-    }
-}
+#endif

@@ -26,6 +26,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -36,6 +37,7 @@
 #include <openssl/md5.h>
 
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 #include <android-base/stringprintf.h>
 #include <cutils/fs.h>
 #include <cutils/log.h>
@@ -88,7 +90,15 @@ const char *VolumeManager::ASECDIR           = "/mnt/asec";
  */
 const char *VolumeManager::LOOPDIR           = "/mnt/obb";
 
-static const char* kUserMountPath = "/mnt/user";
+bool VolumeManager::shutting_down = false;
+
+static const char* kPathUserMount = "/mnt/user";
+static const char* kPathVirtualDisk = "/data/misc/vold/virtual_disk";
+
+static const char* kPropVirtualDisk = "persist.sys.virtual_disk";
+
+/* 512MiB is large enough for testing purposes */
+static const unsigned int kSizeVirtualDisk = 536870912;
 
 static const unsigned int kMajorBlockMmc = 179;
 static const unsigned int kMajorBlockExperimentalMin = 240;
@@ -174,7 +184,7 @@ static int setupDevMapperDevice(char* buffer, size_t len, const char* loopDevice
         }
         *createdDMDevice = true;
     } else {
-        strcpy(buffer, loopDevice);
+        strlcpy(buffer, loopDevice, len);
         *createdDMDevice = false;
     }
     return 0;
@@ -249,6 +259,55 @@ char *VolumeManager::asecHash(const char *id, char *buffer, size_t len) {
     return buffer;
 }
 
+int VolumeManager::updateVirtualDisk() {
+    if (property_get_bool(kPropVirtualDisk, false)) {
+        if (access(kPathVirtualDisk, F_OK) != 0) {
+            Loop::createImageFile(kPathVirtualDisk, kSizeVirtualDisk / 512);
+        }
+
+        if (mVirtualDisk == nullptr) {
+            if (Loop::create(kPathVirtualDisk, mVirtualDiskPath) != 0) {
+                LOG(ERROR) << "Failed to create virtual disk";
+                return -1;
+            }
+
+            struct stat buf;
+            if (stat(mVirtualDiskPath.c_str(), &buf) < 0) {
+                PLOG(ERROR) << "Failed to stat " << mVirtualDiskPath;
+                return -1;
+            }
+
+            auto disk = new android::vold::Disk("virtual", buf.st_rdev, "virtual",
+                    android::vold::Disk::Flags::kAdoptable | android::vold::Disk::Flags::kSd);
+            disk->create();
+            mVirtualDisk = std::shared_ptr<android::vold::Disk>(disk);
+            mDisks.push_back(mVirtualDisk);
+        }
+    } else {
+        if (mVirtualDisk != nullptr) {
+            dev_t device = mVirtualDisk->getDevice();
+
+            auto i = mDisks.begin();
+            while (i != mDisks.end()) {
+                if ((*i)->getDevice() == device) {
+                    (*i)->destroy();
+                    i = mDisks.erase(i);
+                } else {
+                    ++i;
+                }
+            }
+
+            Loop::destroyByDevice(mVirtualDiskPath.c_str());
+            mVirtualDisk = nullptr;
+        }
+
+        if (access(kPathVirtualDisk, F_OK) == 0) {
+            unlink(kPathVirtualDisk);
+        }
+    }
+    return 0;
+}
+
 int VolumeManager::setDebug(bool enable) {
     mDebug = enable;
     return 0;
@@ -265,6 +324,9 @@ int VolumeManager::start() {
     mInternalEmulated = std::shared_ptr<android::vold::VolumeBase>(
             new android::vold::EmulatedVolume("/data/media"));
     mInternalEmulated->create();
+
+    // Consider creating a virtual disk
+    updateVirtualDisk();
 
     return 0;
 }
@@ -350,6 +412,7 @@ void VolumeManager::handleBlockEvent(NetlinkEvent *evt) {
 }
 
 void VolumeManager::addDiskSource(const std::shared_ptr<DiskSource>& diskSource) {
+    std::lock_guard<std::mutex> lock(mLock);
     mDiskSources.push_back(diskSource);
 }
 
@@ -363,7 +426,10 @@ std::shared_ptr<android::vold::Disk> VolumeManager::findDisk(const std::string& 
 }
 
 std::shared_ptr<android::vold::VolumeBase> VolumeManager::findVolume(const std::string& id) {
-    if (mInternalEmulated->getId() == id) {
+    // Vold could receive "mount" after "shutdown" command in the extreme case.
+    // If this happens, mInternalEmulated will equal nullptr and
+    // we need to deal with it in order to avoid null pointer crash.
+    if (mInternalEmulated != nullptr && mInternalEmulated->getId() == id) {
         return mInternalEmulated;
     }
     for (const auto& disk : mDisks) {
@@ -454,7 +520,7 @@ int VolumeManager::onUserStarted(userid_t userId) {
     // Note that sometimes the system will spin up processes from Zygote
     // before actually starting the user, so we're okay if Zygote
     // already created this directory.
-    std::string path(StringPrintf("%s/%d", kUserMountPath, userId));
+    std::string path(StringPrintf("%s/%d", kPathUserMount, userId));
     fs_prepare_dir(path.c_str(), 0755, AID_ROOT, AID_ROOT);
 
     mStartedUsers.insert(userId);
@@ -531,6 +597,10 @@ int VolumeManager::remountUid(uid_t uid, const std::string& mode) {
 
     // Poke through all running PIDs look for apps running as UID
     while ((de = readdir(dir))) {
+        pid_t pid;
+        if (de->d_type != DT_DIR) continue;
+        if (!android::base::ParseInt(de->d_name, &pid)) continue;
+
         pidFd = -1;
         nsFd = -1;
 
@@ -558,7 +628,7 @@ int VolumeManager::remountUid(uid_t uid, const std::string& mode) {
         }
 
         // We purposefully leave the namespace open across the fork
-        nsFd = openat(pidFd, "ns/mnt", O_RDONLY);
+        nsFd = openat(pidFd, "ns/mnt", O_RDONLY); // not O_CLOEXEC
         if (nsFd < 0) {
             PLOG(WARNING) << "Failed to open namespace for " << de->d_name;
             goto next;
@@ -584,8 +654,14 @@ int VolumeManager::remountUid(uid_t uid, const std::string& mode) {
                 _exit(0);
             }
             if (TEMP_FAILURE_RETRY(mount(storageSource.c_str(), "/storage",
-                    NULL, MS_BIND | MS_REC | MS_SLAVE, NULL)) == -1) {
+                    NULL, MS_BIND | MS_REC, NULL)) == -1) {
                 PLOG(ERROR) << "Failed to mount " << storageSource << " for "
+                        << de->d_name;
+                _exit(1);
+            }
+            if (TEMP_FAILURE_RETRY(mount(NULL, "/storage", NULL,
+                    MS_REC | MS_SLAVE, NULL)) == -1) {
+                PLOG(ERROR) << "Failed to set MS_SLAVE to /storage for "
                         << de->d_name;
                 _exit(1);
             }
@@ -621,23 +697,33 @@ next:
 int VolumeManager::reset() {
     // Tear down all existing disks/volumes and start from a blank slate so
     // newly connected framework hears all events.
-    mInternalEmulated->destroy();
-    mInternalEmulated->create();
+    if (mInternalEmulated != nullptr) {
+        mInternalEmulated->destroy();
+        mInternalEmulated->create();
+    }
     for (const auto& disk : mDisks) {
         disk->destroy();
         disk->create();
     }
+    updateVirtualDisk();
     mAddedUsers.clear();
     mStartedUsers.clear();
     return 0;
 }
 
+// Can be called twice (sequentially) during shutdown. should be safe for that.
 int VolumeManager::shutdown() {
+    if (mInternalEmulated == nullptr) {
+        return 0; // already shutdown
+    }
+    shutting_down = true;
     mInternalEmulated->destroy();
+    mInternalEmulated = nullptr;
     for (const auto& disk : mDisks) {
         disk->destroy();
     }
     mDisks.clear();
+    shutting_down = false;
     return 0;
 }
 
@@ -860,7 +946,7 @@ int VolumeManager::createAsec(const char *id, unsigned long numSectors, const ch
         cleanupDm = true;
     } else {
         sb.c_cipher = ASEC_SB_C_CIPHER_NONE;
-        strcpy(dmDevice, loopDevice);
+        strlcpy(dmDevice, loopDevice, sizeof(dmDevice));
     }
 
     /*
@@ -1001,24 +1087,6 @@ int VolumeManager::resizeAsec(const char *id, unsigned long numSectors, const ch
 
     oldNumSec = info.st_size / 512;
 
-    unsigned long numImgSectors;
-    if (sb.c_opts & ASEC_SB_C_OPTS_EXT4)
-        numImgSectors = adjustSectorNumExt4(numSectors);
-    else
-        numImgSectors = adjustSectorNumFAT(numSectors);
-    /*
-     *  add one block for the superblock
-     */
-    SLOGD("Resizing from %lu sectors to %lu sectors", oldNumSec, numImgSectors + 1);
-    if (oldNumSec == numImgSectors + 1) {
-        SLOGW("Size unchanged; ignoring resize request");
-        return 0;
-    } else if (oldNumSec > numImgSectors + 1) {
-        SLOGE("Only growing is currently supported.");
-        close(fd);
-        return -1;
-    }
-
     /*
      * Try to read superblock.
      */
@@ -1044,9 +1112,25 @@ int VolumeManager::resizeAsec(const char *id, unsigned long numSectors, const ch
         return -1;
     }
 
+    unsigned long numImgSectors;
     if (!(sb.c_opts & ASEC_SB_C_OPTS_EXT4)) {
         SLOGE("Only ext4 partitions are supported for resize");
         errno = EINVAL;
+        return -1;
+    } else {
+        numImgSectors = adjustSectorNumExt4(numSectors);
+    }
+
+    /*
+     *  add one block for the superblock
+     */
+    SLOGD("Resizing from %lu sectors to %lu sectors", oldNumSec, numImgSectors + 1);
+    if (oldNumSec == numImgSectors + 1) {
+        SLOGW("Size unchanged; ignoring resize request");
+        return 0;
+    } else if (oldNumSec > numImgSectors + 1) {
+        SLOGE("Only growing is currently supported.");
+        close(fd);
         return -1;
     }
 
@@ -1826,7 +1910,7 @@ int VolumeManager::listMountedObbs(SocketClient* cli) {
     // Create a string to compare against that has a trailing slash
     int loopDirLen = strlen(VolumeManager::LOOPDIR);
     char loopDir[loopDirLen + 2];
-    strcpy(loopDir, VolumeManager::LOOPDIR);
+    strlcpy(loopDir, VolumeManager::LOOPDIR, sizeof(loopDir));
     loopDir[loopDirLen++] = '/';
     loopDir[loopDirLen] = '\0';
 

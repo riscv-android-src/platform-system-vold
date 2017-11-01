@@ -70,6 +70,9 @@ public:
     static const char *ASECDIR;
     static const char *LOOPDIR;
 
+    //TODO remove this with better solution, b/64143519
+    static bool shutting_down;
+
 private:
     static VolumeManager *sInstance;
 
@@ -176,6 +179,7 @@ public:
     int unmountLoopImage(const char *containerId, const char *loopId,
             const char *fileName, const char *mountPoint, bool force);
 
+    int updateVirtualDisk();
     int setDebug(bool enable);
 
     void setBroadcaster(SocketListener *sl) { mBroadcaster = sl; }
@@ -211,6 +215,8 @@ private:
     std::unordered_map<userid_t, int> mAddedUsers;
     std::unordered_set<userid_t> mStartedUsers;
 
+    std::string mVirtualDiskPath;
+    std::shared_ptr<android::vold::Disk> mVirtualDisk;
     std::shared_ptr<android::vold::VolumeBase> mInternalEmulated;
     std::shared_ptr<android::vold::VolumeBase> mPrimary;
 };

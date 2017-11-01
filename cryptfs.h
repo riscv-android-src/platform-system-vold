@@ -228,7 +228,7 @@ extern "C" {
                           unsigned char *ikey, void *params);
 
   int cryptfs_crypto_complete(void);
-  int cryptfs_check_passwd(char *pw);
+  int cryptfs_check_passwd(const char *pw);
   int cryptfs_verify_passwd(char *newpw);
   int cryptfs_restart(void);
   int cryptfs_enable(char *flag, int type, char *passwd, int no_ui);
@@ -237,7 +237,6 @@ extern "C" {
   int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev,
           const unsigned char* key, int keysize, char* out_crypto_blkdev);
   int cryptfs_revert_ext_volume(const char* label);
-  int cryptfs_enable_file();
   int cryptfs_getfield(const char *fieldname, char *value, int len);
   int cryptfs_setfield(const char *fieldname, const char *value);
   int cryptfs_mount_default_encrypted(void);
@@ -252,7 +251,8 @@ extern "C" {
                              unsigned char* master_key);
   int cryptfs_set_password(struct crypt_mnt_ftr* ftr, const char* password,
                            const unsigned char* master_key);
-  const char* cryptfs_get_file_encryption_mode();
+  void cryptfs_get_file_encryption_modes(const char **contents_mode_ret,
+                                         const char **filenames_mode_ret);
 
 #ifdef __cplusplus
 }

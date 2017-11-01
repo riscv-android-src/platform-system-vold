@@ -17,14 +17,15 @@
 #include "sehandle.h"
 #include "Utils.h"
 #include "Process.h"
+#include "VolumeManager.h"
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <cutils/fs.h>
-#include <cutils/properties.h>
-#include <private/android_filesystem_config.h>
 #include <logwrap/logwrap.h>
+#include <private/android_filesystem_config.h>
 
 #include <mutex>
 #include <dirent.h>
@@ -34,6 +35,7 @@
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <sys/statvfs.h>
 
@@ -125,22 +127,22 @@ status_t ForceUnmount(const std::string& path) {
     }
     // Apps might still be handling eject request, so wait before
     // we start sending signals
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
 
     Process::killProcessesWithOpenFiles(cpath, SIGINT);
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
     }
 
     Process::killProcessesWithOpenFiles(cpath, SIGTERM);
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
     }
 
     Process::killProcessesWithOpenFiles(cpath, SIGKILL);
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
     if (!umount2(cpath, UMOUNT_NOFOLLOW) || errno == EINVAL || errno == ENOENT) {
         return OK;
     }
@@ -153,17 +155,17 @@ status_t KillProcessesUsingPath(const std::string& path) {
     if (Process::killProcessesWithOpenFiles(cpath, SIGINT) == 0) {
         return OK;
     }
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
 
     if (Process::killProcessesWithOpenFiles(cpath, SIGTERM) == 0) {
         return OK;
     }
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
 
     if (Process::killProcessesWithOpenFiles(cpath, SIGKILL) == 0) {
         return OK;
     }
-    sleep(5);
+    if (!VolumeManager::shutting_down) sleep(5);
 
     // Send SIGKILL a second time to determine if we've
     // actually killed everyone with open files
@@ -292,7 +294,7 @@ status_t ForkExecvp(const std::vector<std::string>& args,
         LOG(ERROR) << "Failed to setexeccon";
         abort();
     }
-    FILE* fp = popen(cmd.c_str(), "r");
+    FILE* fp = popen(cmd.c_str(), "r"); // NOLINT
     if (setexeccon(nullptr)) {
         LOG(ERROR) << "Failed to setexeccon";
         abort();
@@ -432,7 +434,7 @@ status_t NormalizeHex(const std::string& in, std::string& out) {
 uint64_t GetFreeBytes(const std::string& path) {
     struct statvfs sb;
     if (statvfs(path.c_str(), &sb) == 0) {
-        return (uint64_t)sb.f_bfree * sb.f_bsize;
+        return (uint64_t) sb.f_bavail * sb.f_frsize;
     } else {
         return -1;
     }
@@ -483,7 +485,7 @@ int64_t calculate_dir_size(int dfd) {
                     continue;
             }
 
-            subfd = openat(dfd, name, O_RDONLY | O_DIRECTORY);
+            subfd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (subfd >= 0) {
                 size += calculate_dir_size(subfd);
             }
@@ -494,7 +496,7 @@ int64_t calculate_dir_size(int dfd) {
 }
 
 uint64_t GetTreeBytes(const std::string& path) {
-    int dirfd = open(path.c_str(), O_DIRECTORY, O_RDONLY);
+    int dirfd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dirfd < 0) {
         PLOG(WARNING) << "Failed to open " << path;
         return -1;
@@ -589,11 +591,6 @@ std::string BuildDataProfilesDePath(userid_t userId) {
     return StringPrintf("%s/misc/profiles/cur/%u", BuildDataPath(nullptr).c_str(), userId);
 }
 
-std::string BuildDataProfilesForeignDexDePath(userid_t userId) {
-    std::string profiles_path = BuildDataProfilesDePath(userId);
-    return StringPrintf("%s/foreign-dex", profiles_path.c_str());
-}
-
 std::string BuildDataPath(const char* volumeUuid) {
     // TODO: unify with installd path generation logic
     if (volumeUuid == nullptr) {
@@ -613,15 +610,15 @@ std::string BuildDataMediaCePath(const char* volumeUuid, userid_t userId) {
 std::string BuildDataUserCePath(const char* volumeUuid, userid_t userId) {
     // TODO: unify with installd path generation logic
     std::string data(BuildDataPath(volumeUuid));
-    if (volumeUuid == nullptr) {
-        if (userId == 0) {
-            return StringPrintf("%s/data", data.c_str());
-        } else {
-            return StringPrintf("%s/user/%u", data.c_str(), userId);
+    if (volumeUuid == nullptr && userId == 0) {
+        std::string legacy = StringPrintf("%s/data", data.c_str());
+        struct stat sb;
+        if (lstat(legacy.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
+            /* /data/data is dir, return /data/data for legacy system */
+            return legacy;
         }
-    } else {
-        return StringPrintf("%s/user/%u", data.c_str(), userId);
     }
+    return StringPrintf("%s/user/%u", data.c_str(), userId);
 }
 
 std::string BuildDataUserDePath(const char* volumeUuid, userid_t userId) {
@@ -640,28 +637,15 @@ dev_t GetDevice(const std::string& path) {
     }
 }
 
-std::string DefaultFstabPath() {
-    char hardware[PROPERTY_VALUE_MAX];
-    property_get("ro.hardware", hardware, "");
-    return StringPrintf("/fstab.%s", hardware);
-}
-
 status_t RestoreconRecursive(const std::string& path) {
     LOG(VERBOSE) << "Starting restorecon of " << path;
 
-    // TODO: find a cleaner way of waiting for restorecon to finish
-    const char* cpath = path.c_str();
-    property_set("selinux.restorecon_recursive", "");
-    property_set("selinux.restorecon_recursive", cpath);
+    static constexpr const char* kRestoreconString = "selinux.restorecon_recursive";
 
-    char value[PROPERTY_VALUE_MAX];
-    while (true) {
-        property_get("selinux.restorecon_recursive", value, "");
-        if (strcmp(cpath, value) == 0) {
-            break;
-        }
-        usleep(100000); // 100ms
-    }
+    android::base::SetProperty(kRestoreconString, "");
+    android::base::SetProperty(kRestoreconString, path);
+
+    android::base::WaitForProperty(kRestoreconString, path);
 
     LOG(VERBOSE) << "Finished restorecon of " << path;
     return OK;
@@ -679,22 +663,8 @@ status_t SaneReadLinkAt(int dirfd, const char* path, char* buf, size_t bufsiz) {
     }
 }
 
-ScopedFd::ScopedFd(int fd) : fd_(fd) {}
-
-ScopedFd::~ScopedFd() {
-    close(fd_);
-}
-
-ScopedDir::ScopedDir(DIR* dir) : dir_(dir) {}
-
-ScopedDir::~ScopedDir() {
-    if (dir_ != nullptr) {
-        closedir(dir_);
-    }
-}
-
 bool IsRunningInEmulator() {
-    return property_get_bool("ro.kernel.qemu", 0);
+    return android::base::GetBoolProperty("ro.kernel.qemu", false);
 }
 
 }  // namespace vold

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2016 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,18 +14,10 @@
  * limitations under the License.
  */
 
-#ifndef _CHECKBATTERY_H__
-#define _CHECKBATTERY_H__
+#ifndef _METADATA_CRYPT_H
+#define _METADATA_CRYPT_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int is_battery_ok_to_start();
-int is_battery_ok_to_continue();
-
-#ifdef __cplusplus
-}
-#endif
+bool e4crypt_mount_metadata_encrypted();
+bool e4crypt_enable_crypto();
 
 #endif
