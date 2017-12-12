@@ -96,6 +96,8 @@ extern "C" {
 #define RETRY_MOUNT_ATTEMPTS 10
 #define RETRY_MOUNT_DELAY_SECONDS 1
 
+static int put_crypt_ftr_and_key(struct crypt_mnt_ftr* crypt_ftr);
+
 static unsigned char saved_master_key[KEY_LEN_BYTES];
 static char *saved_mount_point;
 static int  master_key_saved = 0;
@@ -120,7 +122,7 @@ static int keymaster_create_key(struct crypt_mnt_ftr *ftr)
             &ftr->keymaster_blob_size);
     if (rc) {
         if (ftr->keymaster_blob_size > KEYMASTER_BLOB_SIZE) {
-            SLOGE("Keymaster key blob to large)");
+            SLOGE("Keymaster key blob too large");
             ftr->keymaster_blob_size = 0;
         }
         SLOGE("Failed to generate keypair");
@@ -169,8 +171,31 @@ static int keymaster_sign_object(struct crypt_mnt_ftr *ftr,
             SLOGE("Unknown KDF type %d", ftr->kdf_type);
             return -1;
     }
-    return keymaster_sign_object_for_cryptfs_scrypt(ftr->keymaster_blob, ftr->keymaster_blob_size,
-            KEYMASTER_CRYPTFS_RATE_LIMIT, to_sign, to_sign_size, signature, signature_size);
+    for (;;) {
+        auto result = keymaster_sign_object_for_cryptfs_scrypt(
+            ftr->keymaster_blob, ftr->keymaster_blob_size, KEYMASTER_CRYPTFS_RATE_LIMIT, to_sign,
+            to_sign_size, signature, signature_size);
+        switch (result) {
+            case KeymasterSignResult::ok:
+                return 0;
+            case KeymasterSignResult::upgrade:
+                break;
+            default:
+                return -1;
+        }
+        SLOGD("Upgrading key");
+        if (keymaster_upgrade_key_for_cryptfs_scrypt(
+                RSA_KEY_SIZE, RSA_EXPONENT, KEYMASTER_CRYPTFS_RATE_LIMIT, ftr->keymaster_blob,
+                ftr->keymaster_blob_size, ftr->keymaster_blob, KEYMASTER_BLOB_SIZE,
+                &ftr->keymaster_blob_size) != 0) {
+            SLOGE("Failed to upgrade key");
+            return -1;
+        }
+        if (put_crypt_ftr_and_key(ftr) != 0) {
+            SLOGE("Failed to write upgraded key to disk");
+        }
+        SLOGD("Key upgraded successfully");
+    }
 }
 
 /* Store password when userdata is successfully decrypted and mounted.
@@ -1301,29 +1326,24 @@ int wait_and_unmount(const char *mountpoint, bool kill)
     return rc;
 }
 
-static int prep_data_fs(void)
+static void prep_data_fs(void)
 {
-    int i;
-
     // NOTE: post_fs_data results in init calling back around to vold, so all
     // callers to this method must be async
 
     /* Do the prep of the /data filesystem */
     property_set("vold.post_fs_data_done", "0");
     property_set("vold.decrypt", "trigger_post_fs_data");
-    SLOGD("Just triggered post_fs_data\n");
+    SLOGD("Just triggered post_fs_data");
 
     /* Wait a max of 50 seconds, hopefully it takes much less */
-    if (!android::base::WaitForProperty("vold.post_fs_data_done",
+    while (!android::base::WaitForProperty("vold.post_fs_data_done",
                                         "1",
-                                        std::chrono::seconds(50))) {
-        /* Ugh, we failed to prep /data in time.  Bail. */
-        SLOGE("post_fs_data timed out!\n");
-        return -1;
-    } else {
-        SLOGD("post_fs_data done\n");
-        return 0;
+                                        std::chrono::seconds(15))) {
+        /* We timed out to prep /data in time.  Continue wait. */
+        SLOGE("waited 15s for vold.post_fs_data_done, still waiting...");
     }
+    SLOGD("post_fs_data done");
 }
 
 static void cryptfs_set_corrupt()
@@ -1474,9 +1494,7 @@ static int cryptfs_restart_internal(int restart_main)
         }
 
         /* Create necessary paths on /data */
-        if (prep_data_fs()) {
-            return -1;
-        }
+        prep_data_fs();
         property_set("vold.decrypt", "trigger_load_persist_props");
 
         /* startup service classes main and late_start */
@@ -1944,15 +1962,20 @@ static int cryptfs_enable_wipe(char *crypto_blkdev, off64_t size, int type)
         SLOGI("Making empty filesystem with command %s %s %s %s %s %s\n",
               args[0], args[1], args[2], args[3], args[4], args[5]);
     } else if (type == F2FS_FS) {
-        args[0] = "/system/bin/mkfs.f2fs";
-        args[1] = "-t";
+        args[0] = "/system/bin/make_f2fs";
+        args[1] = "-f";
         args[2] = "-d1";
-        args[3] = crypto_blkdev;
+        args[3] = "-O";
+        args[4] = "encrypt";
+        args[5] = "-O";
+        args[6] = "quota";
+        args[7] = crypto_blkdev;
         snprintf(size_str, sizeof(size_str), "%" PRId64, size);
-        args[4] = size_str;
-        num_args = 5;
-        SLOGI("Making empty filesystem with command %s %s %s %s %s\n",
-              args[0], args[1], args[2], args[3], args[4]);
+        args[8] = size_str;
+        num_args = 9;
+        SLOGI("Making empty filesystem with command %s %s %s %s %s %s %s %s %s\n",
+              args[0], args[1], args[2], args[3], args[4], args[5],
+              args[6], args[7], args[8]);
     } else {
         SLOGE("cryptfs_enable_wipe(): unknown filesystem type %d\n", type);
         return -1;
@@ -2210,9 +2233,7 @@ int cryptfs_enable_internal(char *howarg, int crypt_type, const char *passwd,
 
         /* restart the framework. */
         /* Create necessary paths on /data */
-        if (prep_data_fs()) {
-            goto error_shutting_down;
-        }
+        prep_data_fs();
 
         /* Ugh, shutting down the framework is not synchronous, so until it
          * can be fixed, this horrible hack will wait a moment for it all to
