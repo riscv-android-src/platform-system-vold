@@ -24,6 +24,7 @@
 #include "Ext4Crypt.h"
 
 #include <android-base/file.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/logging.h>
 #include <diskconfig/diskconfig.h>
@@ -49,7 +50,8 @@ static const char* kSgdiskPath = "/system/bin/sgdisk";
 static const char* kSgdiskToken = " \t\n";
 
 static const char* kSysfsLoopMaxMinors = "/sys/module/loop/parameters/max_part";
-static const char* kSysfsMmcMaxMinors = "/sys/module/mmcblk/parameters/perdev_minors";
+static const char* kSysfsMmcMaxMinorsDeprecated = "/sys/module/mmcblk/parameters/perdev_minors";
+static const char* kSysfsMmcMaxMinors = "/sys/module/mmc_block/parameters/perdev_minors";
 
 static const unsigned int kMajorBlockLoop = 7;
 static const unsigned int kMajorBlockScsiA = 8;
@@ -446,7 +448,8 @@ status_t Disk::partitionPrivate() {
 status_t Disk::partitionMixed(int8_t ratio) {
     int res;
 
-    if (e4crypt_is_native()) {
+    if (e4crypt_is_native()
+            && !android::base::GetBoolProperty("persist.sys.adoptable_fbe", false)) {
         LOG(ERROR) << "Private volumes not yet supported on FBE devices";
         return -EINVAL;
     }
@@ -469,9 +472,14 @@ status_t Disk::partitionMixed(int8_t ratio) {
     // We've had some success above, so generate both the private partition
     // GUID and encryption key and persist them.
     std::string partGuidRaw;
+    if (GenerateRandomUuid(partGuidRaw) != OK) {
+        LOG(ERROR) << "Failed to generate GUID";
+        return -EIO;
+    }
+
     std::string keyRaw;
-    if (ReadRandomBytes(16, partGuidRaw) || ReadRandomBytes(16, keyRaw)) {
-        LOG(ERROR) << "Failed to generate GUID or key";
+    if (ReadRandomBytes(16, keyRaw) != OK) {
+        LOG(ERROR) << "Failed to generate key";
         return -EIO;
     }
 
@@ -559,7 +567,8 @@ int Disk::getMaxMinors() {
     case kMajorBlockMmc: {
         // Per Documentation/devices.txt this is dynamic
         std::string tmp;
-        if (!ReadFileToString(kSysfsMmcMaxMinors, &tmp)) {
+        if (!ReadFileToString(kSysfsMmcMaxMinors, &tmp) &&
+                !ReadFileToString(kSysfsMmcMaxMinorsDeprecated, &tmp)) {
             LOG(ERROR) << "Failed to read max minors";
             return -errno;
         }
