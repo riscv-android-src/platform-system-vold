@@ -191,7 +191,8 @@ status_t PublicVolume::doMount() {
         usleep(50000); // 50ms
     }
     /* sdcardfs will have exited already. FUSE will still be running */
-    TEMP_FAILURE_RETRY(waitpid(mFusePid, nullptr, WNOHANG));
+    TEMP_FAILURE_RETRY(waitpid(mFusePid, nullptr, 0));
+    mFusePid = 0;
 
     return OK;
 }
@@ -209,12 +210,6 @@ status_t PublicVolume::doUnmount() {
     ForceUnmount(mFuseRead);
     ForceUnmount(mFuseWrite);
     ForceUnmount(mRawPath);
-
-    if (mFusePid > 0) {
-        kill(mFusePid, SIGTERM);
-        TEMP_FAILURE_RETRY(waitpid(mFusePid, nullptr, 0));
-        mFusePid = 0;
-    }
 
     rmdir(mFuseDefault.c_str());
     rmdir(mFuseRead.c_str());
