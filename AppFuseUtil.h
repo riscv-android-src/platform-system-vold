@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,26 +14,23 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_VOLD_VFAT_H
-#define ANDROID_VOLD_VFAT_H
+#ifndef ANDROID_VOLD_APP_FUSE_UTIL_H_
+#define ANDROID_VOLD_APP_FUSE_UTIL_H_
 
-#include <utils/Errors.h>
+#include <android-base/unique_fd.h>
 
-#include <string>
+#define DEBUG_APPFUSE 0
 
 namespace android {
 namespace vold {
-namespace vfat {
 
-bool IsSupported();
+int MountAppFuse(uid_t uid, int mountId, android::base::unique_fd* device_fd);
 
-status_t Check(const std::string& source);
-status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
-               bool executable, int ownerUid, int ownerGid, int permMask, bool createLost);
-status_t Format(const std::string& source, unsigned long numSectors);
+int UnmountAppFuse(uid_t uid, int mountId);
 
-}  // namespace vfat
+int OpenAppFuseFile(uid_t uid, int mountId, int fileId, int flags);
+
 }  // namespace vold
 }  // namespace android
 
-#endif
+#endif  // ANDROID_VOLD_APP_FUSE_UTIL_H_

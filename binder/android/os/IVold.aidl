@@ -44,22 +44,22 @@ interface IVold {
     void checkEncryption(@utf8InCpp String volId);
 
     void moveStorage(@utf8InCpp String fromVolId, @utf8InCpp String toVolId,
-            IVoldTaskListener listener);
+                     IVoldTaskListener listener);
 
     void remountUid(int uid, int remountMode);
 
     void mkdirs(@utf8InCpp String path);
 
-    @utf8InCpp String createObb(@utf8InCpp String sourcePath,
-            @utf8InCpp String sourceKey, int ownerGid);
+    @utf8InCpp String createObb(@utf8InCpp String sourcePath, @utf8InCpp String sourceKey,
+                                int ownerGid);
     void destroyObb(@utf8InCpp String volId);
 
     void fstrim(int fstrimFlags, IVoldTaskListener listener);
     void runIdleMaint(IVoldTaskListener listener);
     void abortIdleMaint(IVoldTaskListener listener);
 
-    FileDescriptor mountAppFuse(int uid, int pid, int mountId);
-    void unmountAppFuse(int uid, int pid, int mountId);
+    FileDescriptor mountAppFuse(int uid, int mountId);
+    void unmountAppFuse(int uid, int mountId);
 
     void fdeCheckPassword(@utf8InCpp String password);
     void fdeRestart();
@@ -84,14 +84,33 @@ interface IVold {
     void createUserKey(int userId, int userSerial, boolean ephemeral);
     void destroyUserKey(int userId);
 
-    void addUserKeyAuth(int userId, int userSerial, @utf8InCpp String token, @utf8InCpp String secret);
+    void addUserKeyAuth(int userId, int userSerial, @utf8InCpp String token,
+                        @utf8InCpp String secret);
     void fixateNewestUserKeyAuth(int userId);
 
-    void unlockUserKey(int userId, int userSerial, @utf8InCpp String token, @utf8InCpp String secret);
+    void unlockUserKey(int userId, int userSerial, @utf8InCpp String token,
+                       @utf8InCpp String secret);
     void lockUserKey(int userId);
 
-    void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int userSerial, int storageFlags);
+    void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int userSerial,
+                            int storageFlags);
     void destroyUserStorage(@nullable @utf8InCpp String uuid, int userId, int storageFlags);
+
+    void startCheckpoint(int retry);
+    boolean needsCheckpoint();
+    boolean needsRollback();
+    void abortChanges();
+    void commitChanges();
+    void prepareCheckpoint();
+    void restoreCheckpoint(@utf8InCpp String device);
+    void markBootAttempt();
+
+    @utf8InCpp String createStubVolume(@utf8InCpp String sourcePath,
+            @utf8InCpp String mountPath, @utf8InCpp String fsType,
+            @utf8InCpp String fsUuid, @utf8InCpp String fsLabel);
+    void destroyStubVolume(@utf8InCpp String volId);
+
+    FileDescriptor openAppFuseFile(int uid, int mountId, int fileId, int flags);
 
     const int ENCRYPTION_FLAG_NO_UI = 4;
 
@@ -139,4 +158,5 @@ interface IVold {
     const int VOLUME_TYPE_EMULATED = 2;
     const int VOLUME_TYPE_ASEC = 3;
     const int VOLUME_TYPE_OBB = 4;
+    const int VOLUME_TYPE_STUB = 5;
 }

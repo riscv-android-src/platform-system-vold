@@ -19,31 +19,39 @@
 #include "Process.h"
 #include "sehandle.h"
 
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
-#include <android-base/strings.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 #include <cutils/fs.h>
 #include <logwrap/logwrap.h>
 #include <private/android_filesystem_config.h>
 
-#include <mutex>
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <mntent.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
-#include <sys/wait.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#include <list>
+#include <mutex>
+#include <thread>
 
 #ifndef UMOUNT_NOFOLLOW
-#define UMOUNT_NOFOLLOW    0x00000008  /* Don't follow symlink on umount */
+#define UMOUNT_NOFOLLOW 0x00000008 /* Don't follow symlink on umount */
 #endif
 
+using namespace std::chrono_literals;
 using android::base::ReadFileToString;
 using android::base::StringPrintf;
 
@@ -81,8 +89,8 @@ status_t CreateDeviceNode(const std::string& path, dev_t dev) {
     mode_t mode = 0660 | S_IFBLK;
     if (mknod(cpath, mode, dev) < 0) {
         if (errno != EEXIST) {
-            PLOG(ERROR) << "Failed to create device node for " << major(dev)
-                    << ":" << minor(dev) << " at " << path;
+            PLOG(ERROR) << "Failed to create device node for " << major(dev) << ":" << minor(dev)
+                        << " at " << path;
             res = -errno;
         }
     }
@@ -209,8 +217,8 @@ bool FindValue(const std::string& raw, const std::string& key, std::string* valu
     return true;
 }
 
-static status_t readMetadata(const std::string& path, std::string* fsType,
-        std::string* fsUuid, std::string* fsLabel, bool untrusted) {
+static status_t readMetadata(const std::string& path, std::string* fsType, std::string* fsUuid,
+                             std::string* fsLabel, bool untrusted) {
     fsType->clear();
     fsUuid->clear();
     fsLabel->clear();
@@ -228,7 +236,7 @@ static status_t readMetadata(const std::string& path, std::string* fsType,
     cmd.push_back(path);
 
     std::vector<std::string> output;
-    status_t res = ForkExecvp(cmd, output, untrusted ? sBlkidUntrustedContext : sBlkidContext);
+    status_t res = ForkExecvp(cmd, &output, untrusted ? sBlkidUntrustedContext : sBlkidContext);
     if (res != OK) {
         LOG(WARNING) << "blkid failed to identify " << path;
         return res;
@@ -244,112 +252,102 @@ static status_t readMetadata(const std::string& path, std::string* fsType,
     return OK;
 }
 
-status_t ReadMetadata(const std::string& path, std::string* fsType,
-        std::string* fsUuid, std::string* fsLabel) {
+status_t ReadMetadata(const std::string& path, std::string* fsType, std::string* fsUuid,
+                      std::string* fsLabel) {
     return readMetadata(path, fsType, fsUuid, fsLabel, false);
 }
 
-status_t ReadMetadataUntrusted(const std::string& path, std::string* fsType,
-        std::string* fsUuid, std::string* fsLabel) {
+status_t ReadMetadataUntrusted(const std::string& path, std::string* fsType, std::string* fsUuid,
+                               std::string* fsLabel) {
     return readMetadata(path, fsType, fsUuid, fsLabel, true);
 }
 
-status_t ForkExecvp(const std::vector<std::string>& args) {
-    return ForkExecvp(args, nullptr);
-}
-
-status_t ForkExecvp(const std::vector<std::string>& args, security_context_t context) {
-    std::lock_guard<std::mutex> lock(kSecurityLock);
-    size_t argc = args.size();
-    char** argv = (char**) calloc(argc, sizeof(char*));
-    for (size_t i = 0; i < argc; i++) {
-        argv[i] = (char*) args[i].c_str();
-        if (i == 0) {
-            LOG(VERBOSE) << args[i];
+static std::vector<const char*> ConvertToArgv(const std::vector<std::string>& args) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        if (argv.empty()) {
+            LOG(DEBUG) << arg;
         } else {
-            LOG(VERBOSE) << "    " << args[i];
+            LOG(DEBUG) << "    " << arg;
         }
+        argv.emplace_back(arg.data());
     }
-
-    if (context) {
-        if (setexeccon(context)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-    status_t res = android_fork_execvp(argc, argv, NULL, false, true);
-    if (context) {
-        if (setexeccon(nullptr)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-
-    free(argv);
-    return res;
+    argv.emplace_back(nullptr);
+    return argv;
 }
 
-status_t ForkExecvp(const std::vector<std::string>& args,
-        std::vector<std::string>& output) {
-    return ForkExecvp(args, output, nullptr);
-}
-
-status_t ForkExecvp(const std::vector<std::string>& args,
-        std::vector<std::string>& output, security_context_t context) {
-    std::lock_guard<std::mutex> lock(kSecurityLock);
-    std::string cmd;
-    for (size_t i = 0; i < args.size(); i++) {
-        cmd += args[i] + " ";
-        if (i == 0) {
-            LOG(VERBOSE) << args[i];
-        } else {
-            LOG(VERBOSE) << "    " << args[i];
-        }
-    }
-    output.clear();
-
-    if (context) {
-        if (setexeccon(context)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-    FILE* fp = popen(cmd.c_str(), "r"); // NOLINT
-    if (context) {
-        if (setexeccon(nullptr)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-
+static status_t ReadLinesFromFdAndLog(std::vector<std::string>* output,
+                                      android::base::unique_fd ufd) {
+    std::unique_ptr<FILE, int (*)(FILE*)> fp(android::base::Fdopen(std::move(ufd), "r"), fclose);
     if (!fp) {
-        PLOG(ERROR) << "Failed to popen " << cmd;
+        PLOG(ERROR) << "fdopen in ReadLinesFromFdAndLog";
         return -errno;
     }
+    if (output) output->clear();
     char line[1024];
-    while (fgets(line, sizeof(line), fp) != nullptr) {
-        LOG(VERBOSE) << line;
-        output.push_back(std::string(line));
+    while (fgets(line, sizeof(line), fp.get()) != nullptr) {
+        LOG(DEBUG) << line;
+        if (output) output->emplace_back(line);
     }
-    if (pclose(fp) != 0) {
-        PLOG(ERROR) << "Failed to pclose " << cmd;
+    return OK;
+}
+
+status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>* output,
+                    security_context_t context) {
+    auto argv = ConvertToArgv(args);
+
+    android::base::unique_fd pipe_read, pipe_write;
+    if (!android::base::Pipe(&pipe_read, &pipe_write)) {
+        PLOG(ERROR) << "Pipe in ForkExecvp";
         return -errno;
     }
 
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (context) {
+            if (setexeccon(context)) {
+                LOG(ERROR) << "Failed to setexeccon in ForkExecvp";
+                abort();
+            }
+        }
+        pipe_read.reset();
+        if (dup2(pipe_write.get(), STDOUT_FILENO) == -1) {
+            PLOG(ERROR) << "dup2 in ForkExecvp";
+            _exit(EXIT_FAILURE);
+        }
+        pipe_write.reset();
+        execvp(argv[0], const_cast<char**>(argv.data()));
+        PLOG(ERROR) << "exec in ForkExecvp";
+        _exit(EXIT_FAILURE);
+    }
+    if (pid == -1) {
+        PLOG(ERROR) << "fork in ForkExecvp";
+        return -errno;
+    }
+
+    pipe_write.reset();
+    auto st = ReadLinesFromFdAndLog(output, std::move(pipe_read));
+    if (st != 0) return st;
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        PLOG(ERROR) << "waitpid in ForkExecvp";
+        return -errno;
+    }
+    if (!WIFEXITED(status)) {
+        LOG(ERROR) << "Process did not exit normally, status: " << status;
+        return -ECHILD;
+    }
+    if (WEXITSTATUS(status)) {
+        LOG(ERROR) << "Process exited with code: " << WEXITSTATUS(status);
+        return WEXITSTATUS(status);
+    }
     return OK;
 }
 
 pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
-    size_t argc = args.size();
-    char** argv = (char**) calloc(argc + 1, sizeof(char*));
-    for (size_t i = 0; i < argc; i++) {
-        argv[i] = (char*) args[i].c_str();
-        if (i == 0) {
-            LOG(VERBOSE) << args[i];
-        } else {
-            LOG(VERBOSE) << "    " << args[i];
-        }
-    }
+    auto argv = ConvertToArgv(args);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -357,18 +355,14 @@ pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
 
-        if (execvp(argv[0], argv)) {
-            PLOG(ERROR) << "Failed to exec";
-        }
-
-        _exit(1);
+        execvp(argv[0], const_cast<char**>(argv.data()));
+        PLOG(ERROR) << "exec in ForkExecvpAsync";
+        _exit(EXIT_FAILURE);
     }
-
     if (pid == -1) {
-        PLOG(ERROR) << "Failed to exec";
+        PLOG(ERROR) << "fork in ForkExecvpAsync";
+        return -1;
     }
-
-    free(argv);
     return pid;
 }
 
@@ -400,10 +394,10 @@ status_t ReadRandomBytes(size_t bytes, char* buf) {
 status_t GenerateRandomUuid(std::string& out) {
     status_t res = ReadRandomBytes(16, out);
     if (res == OK) {
-        out[6] &= 0x0f;  /* clear version        */
-        out[6] |= 0x40;  /* set to version 4     */
-        out[8] &= 0x3f;  /* clear variant        */
-        out[8] |= 0x80;  /* set to IETF variant  */
+        out[6] &= 0x0f; /* clear version        */
+        out[6] |= 0x40; /* set to version 4     */
+        out[8] &= 0x3f; /* clear variant        */
+        out[8] |= 0x80; /* set to IETF variant  */
     }
     return res;
 }
@@ -415,24 +409,26 @@ status_t HexToStr(const std::string& hex, std::string& str) {
     for (size_t i = 0; i < hex.size(); i++) {
         int val = 0;
         switch (hex[i]) {
-        case ' ': case '-': case ':': continue;
-        case 'f': case 'F': val = 15; break;
-        case 'e': case 'E': val = 14; break;
-        case 'd': case 'D': val = 13; break;
-        case 'c': case 'C': val = 12; break;
-        case 'b': case 'B': val = 11; break;
-        case 'a': case 'A': val = 10; break;
-        case '9': val = 9; break;
-        case '8': val = 8; break;
-        case '7': val = 7; break;
-        case '6': val = 6; break;
-        case '5': val = 5; break;
-        case '4': val = 4; break;
-        case '3': val = 3; break;
-        case '2': val = 2; break;
-        case '1': val = 1; break;
-        case '0': val = 0; break;
-        default: return -EINVAL;
+            // clang-format off
+            case ' ': case '-': case ':': continue;
+            case 'f': case 'F': val = 15; break;
+            case 'e': case 'E': val = 14; break;
+            case 'd': case 'D': val = 13; break;
+            case 'c': case 'C': val = 12; break;
+            case 'b': case 'B': val = 11; break;
+            case 'a': case 'A': val = 10; break;
+            case '9': val = 9; break;
+            case '8': val = 8; break;
+            case '7': val = 7; break;
+            case '6': val = 6; break;
+            case '5': val = 5; break;
+            case '4': val = 4; break;
+            case '3': val = 3; break;
+            case '2': val = 2; break;
+            case '1': val = 1; break;
+            case '0': val = 0; break;
+            default: return -EINVAL;
+                // clang-format on
         }
 
         if (even) {
@@ -475,10 +471,46 @@ status_t NormalizeHex(const std::string& in, std::string& out) {
     return StrToHex(tmp, out);
 }
 
+status_t GetBlockDevSize(int fd, uint64_t* size) {
+    if (ioctl(fd, BLKGETSIZE64, size)) {
+        return -errno;
+    }
+
+    return OK;
+}
+
+status_t GetBlockDevSize(const std::string& path, uint64_t* size) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    status_t res = OK;
+
+    if (fd < 0) {
+        return -errno;
+    }
+
+    res = GetBlockDevSize(fd, size);
+
+    close(fd);
+
+    return res;
+}
+
+status_t GetBlockDev512Sectors(const std::string& path, uint64_t* nr_sec) {
+    uint64_t size;
+    status_t res = GetBlockDevSize(path, &size);
+
+    if (res != OK) {
+        return res;
+    }
+
+    *nr_sec = size / 512;
+
+    return OK;
+}
+
 uint64_t GetFreeBytes(const std::string& path) {
     struct statvfs sb;
     if (statvfs(path.c_str(), &sb) == 0) {
-        return (uint64_t) sb.f_bavail * sb.f_frsize;
+        return (uint64_t)sb.f_bavail * sb.f_frsize;
     } else {
         return -1;
     }
@@ -486,7 +518,7 @@ uint64_t GetFreeBytes(const std::string& path) {
 
 // TODO: borrowed from frameworks/native/libs/diskusage/ which should
 // eventually be migrated into system/
-static int64_t stat_size(struct stat *s) {
+static int64_t stat_size(struct stat* s) {
     int64_t blksize = s->st_blksize;
     // count actual blocks used instead of nominal file size
     int64_t size = s->st_blocks * 512;
@@ -504,8 +536,8 @@ static int64_t stat_size(struct stat *s) {
 int64_t calculate_dir_size(int dfd) {
     int64_t size = 0;
     struct stat s;
-    DIR *d;
-    struct dirent *de;
+    DIR* d;
+    struct dirent* de;
 
     d = fdopendir(dfd);
     if (d == NULL) {
@@ -514,7 +546,7 @@ int64_t calculate_dir_size(int dfd) {
     }
 
     while ((de = readdir(d))) {
-        const char *name = de->d_name;
+        const char* name = de->d_name;
         if (fstatat(dfd, name, &s, AT_SYMLINK_NOFOLLOW) == 0) {
             size += stat_size(&s);
         }
@@ -523,10 +555,8 @@ int64_t calculate_dir_size(int dfd) {
 
             /* always skip "." and ".." */
             if (name[0] == '.') {
-                if (name[1] == 0)
-                    continue;
-                if ((name[1] == '.') && (name[2] == 0))
-                    continue;
+                if (name[1] == 0) continue;
+                if ((name[1] == '.') && (name[2] == 0)) continue;
             }
 
             subfd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -561,8 +591,7 @@ bool IsFilesystemSupported(const std::string& fsType) {
 status_t WipeBlockDevice(const std::string& path) {
     status_t res = -1;
     const char* c_path = path.c_str();
-    unsigned long nr_sec = 0;
-    unsigned long long range[2];
+    uint64_t range[2] = {0, 0};
 
     int fd = TEMP_FAILURE_RETRY(open(c_path, O_RDWR | O_CLOEXEC));
     if (fd == -1) {
@@ -570,13 +599,10 @@ status_t WipeBlockDevice(const std::string& path) {
         goto done;
     }
 
-    if ((ioctl(fd, BLKGETSIZE, &nr_sec)) == -1) {
+    if (GetBlockDevSize(fd, &range[1]) != OK) {
         PLOG(ERROR) << "Failed to determine size of " << path;
         goto done;
     }
-
-    range[0] = 0;
-    range[1] = (unsigned long long) nr_sec * 512;
 
     LOG(INFO) << "About to discard " << range[1] << " on " << path;
     if (ioctl(fd, BLKDISCARD, &range) == 0) {
@@ -592,8 +618,7 @@ done:
 }
 
 static bool isValidFilename(const std::string& name) {
-    if (name.empty() || (name == ".") || (name == "..")
-            || (name.find('/') != std::string::npos)) {
+    if (name.empty() || (name == ".") || (name == "..") || (name.find('/') != std::string::npos)) {
         return false;
     } else {
         return true;
@@ -688,7 +713,7 @@ dev_t GetDevice(const std::string& path) {
 }
 
 status_t RestoreconRecursive(const std::string& path) {
-    LOG(VERBOSE) << "Starting restorecon of " << path;
+    LOG(DEBUG) << "Starting restorecon of " << path;
 
     static constexpr const char* kRestoreconString = "selinux.restorecon_recursive";
 
@@ -697,7 +722,7 @@ status_t RestoreconRecursive(const std::string& path) {
 
     android::base::WaitForProperty(kRestoreconString, path);
 
-    LOG(VERBOSE) << "Finished restorecon of " << path;
+    LOG(DEBUG) << "Finished restorecon of " << path;
     return OK;
 }
 
@@ -713,8 +738,7 @@ bool Readlinkat(int dirfd, const std::string& path, std::string* result) {
     while (true) {
         ssize_t size = readlinkat(dirfd, path.c_str(), &buf[0], buf.size());
         // Unrecoverable error?
-        if (size == -1)
-            return false;
+        if (size == -1) return false;
         // It fit! (If size == buf.size(), it may have been truncated.)
         if (static_cast<size_t>(size) < buf.size()) {
             result->assign(&buf[0], size);
@@ -727,6 +751,47 @@ bool Readlinkat(int dirfd, const std::string& path, std::string* result) {
 
 bool IsRunningInEmulator() {
     return android::base::GetBoolProperty("ro.kernel.qemu", false);
+}
+
+status_t UnmountTree(const std::string& prefix) {
+    if (umount2(prefix.c_str(), MNT_DETACH)) {
+        PLOG(ERROR) << "Failed to unmount " << prefix;
+        return -errno;
+    }
+    return OK;
+}
+
+// TODO(118708649): fix duplication with init/util.h
+status_t WaitForFile(const char* filename, std::chrono::nanoseconds timeout) {
+    android::base::Timer t;
+    while (t.duration() < timeout) {
+        struct stat sb;
+        if (stat(filename, &sb) != -1) {
+            LOG(INFO) << "wait for '" << filename << "' took " << t;
+            return 0;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    LOG(WARNING) << "wait for '" << filename << "' timed out and took " << t;
+    return -1;
+}
+
+bool FsyncDirectory(const std::string& dirname) {
+    android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(dirname.c_str(), O_RDONLY | O_CLOEXEC)));
+    if (fd == -1) {
+        PLOG(ERROR) << "Failed to open " << dirname;
+        return false;
+    }
+    if (fsync(fd) == -1) {
+        if (errno == EROFS || errno == EINVAL) {
+            PLOG(WARNING) << "Skip fsync " << dirname
+                          << " on a file system does not support synchronization";
+        } else {
+            PLOG(ERROR) << "Failed to fsync " << dirname;
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace vold
