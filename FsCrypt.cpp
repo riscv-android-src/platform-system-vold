@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "Ext4Crypt.h"
+#include "FsCrypt.h"
 
 #include "KeyStorage.h"
 #include "KeyUtil.h"
@@ -31,12 +31,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <limits.h>
 #include <selinux/android.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <private/android_filesystem_config.h>
 
@@ -50,13 +50,14 @@
 #include <cutils/fs.h>
 #include <cutils/properties.h>
 
-#include <ext4_utils/ext4_crypt.h>
+#include <fscrypt/fscrypt.h>
 #include <keyutils.h>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
+#include <android-base/unique_fd.h>
 
 using android::base::StringPrintf;
 using android::base::WriteStringToFile;
@@ -71,7 +72,7 @@ struct PolicyKeyRef {
     std::string key_raw_ref;
 };
 
-const std::string device_key_dir = std::string() + DATA_MNT_POINT + e4crypt_unencrypted_folder;
+const std::string device_key_dir = std::string() + DATA_MNT_POINT + fscrypt_unencrypted_folder;
 const std::string device_key_path = device_key_dir + "/key";
 const std::string device_key_temp = device_key_dir + "/temp";
 
@@ -93,9 +94,9 @@ std::map<userid_t, std::string> s_ce_key_raw_refs;
 // TODO abolish this map, per b/26948053
 std::map<userid_t, KeyBuffer> s_ce_keys;
 
-}
+}  // namespace
 
-static bool e4crypt_is_emulated() {
+static bool fscrypt_is_emulated() {
     return property_get_bool("persist.sys.emulate_fbe", false);
 }
 
@@ -145,8 +146,7 @@ static std::string get_ce_key_current_path(const std::string& directory_path) {
 }
 
 static bool get_ce_key_new_path(const std::string& directory_path,
-                                const std::vector<std::string>& paths,
-                                std::string *ce_key_path) {
+                                const std::vector<std::string>& paths, std::string* ce_key_path) {
     if (paths.empty()) {
         *ce_key_path = get_ce_key_current_path(directory_path);
         return true;
@@ -163,9 +163,9 @@ static bool get_ce_key_new_path(const std::string& directory_path,
 
 // Discard all keys but the named one; rename it to canonical name.
 // No point in acting on errors in this; ignore them.
-static void fixate_user_ce_key(const std::string& directory_path, const std::string &to_fix,
+static void fixate_user_ce_key(const std::string& directory_path, const std::string& to_fix,
                                const std::vector<std::string>& paths) {
-    for (auto const other_path: paths) {
+    for (auto const other_path : paths) {
         if (other_path != to_fix) {
             android::vold::destroyKey(other_path);
         }
@@ -175,16 +175,18 @@ static void fixate_user_ce_key(const std::string& directory_path, const std::str
         LOG(DEBUG) << "Renaming " << to_fix << " to " << current_path;
         if (rename(to_fix.c_str(), current_path.c_str()) != 0) {
             PLOG(WARNING) << "Unable to rename " << to_fix << " to " << current_path;
+            return;
         }
     }
+    android::vold::FsyncDirectory(directory_path);
 }
 
 static bool read_and_fixate_user_ce_key(userid_t user_id,
                                         const android::vold::KeyAuthentication& auth,
-                                        KeyBuffer *ce_key) {
+                                        KeyBuffer* ce_key) {
     auto const directory_path = get_ce_key_directory_path(user_id);
     auto const paths = get_ce_key_paths(directory_path);
-    for (auto const ce_key_path: paths) {
+    for (auto const ce_key_path : paths) {
         LOG(DEBUG) << "Trying user CE key " << ce_key_path;
         if (android::vold::retrieveKey(ce_key_path, auth, ce_key)) {
             LOG(DEBUG) << "Successfully retrieved key";
@@ -242,12 +244,14 @@ static bool create_and_install_user_keys(userid_t user_id, bool create_ephemeral
         auto const paths = get_ce_key_paths(directory_path);
         std::string ce_key_path;
         if (!get_ce_key_new_path(directory_path, paths, &ce_key_path)) return false;
-        if (!android::vold::storeKeyAtomically(ce_key_path, user_key_temp,
-                kEmptyAuthentication, ce_key)) return false;
+        if (!android::vold::storeKeyAtomically(ce_key_path, user_key_temp, kEmptyAuthentication,
+                                               ce_key))
+            return false;
         fixate_user_ce_key(directory_path, ce_key_path, paths);
         // Write DE key second; once this is written, all is good.
         if (!android::vold::storeKeyAtomically(get_de_key_path(user_id), user_key_temp,
-                kEmptyAuthentication, de_key)) return false;
+                                               kEmptyAuthentication, de_key))
+            return false;
     }
     std::string de_raw_ref;
     if (!android::vold::installKey(de_key, &de_raw_ref)) return false;
@@ -281,7 +285,7 @@ static void get_data_file_encryption_modes(PolicyKeyRef* key_ref) {
 }
 
 static bool ensure_policy(const PolicyKeyRef& key_ref, const std::string& path) {
-    return e4crypt_policy_ensure(path.c_str(), key_ref.key_raw_ref.data(),
+    return fscrypt_policy_ensure(path.c_str(), key_ref.key_raw_ref.data(),
                                  key_ref.key_raw_ref.size(), key_ref.contents_mode.c_str(),
                                  key_ref.filenames_mode.c_str()) == 0;
 }
@@ -325,13 +329,13 @@ static bool load_all_de_keys() {
             LOG(DEBUG) << "Installed de key for user " << user_id;
         }
     }
-    // ext4enc:TODO: go through all DE directories, ensure that all user dirs have the
+    // fscrypt:TODO: go through all DE directories, ensure that all user dirs have the
     // correct policy set on them, and that no rogue ones exist.
     return true;
 }
 
-bool e4crypt_initialize_global_de() {
-    LOG(INFO) << "e4crypt_initialize_global_de";
+bool fscrypt_initialize_global_de() {
+    LOG(INFO) << "fscrypt_initialize_global_de";
 
     if (s_global_de_initialized) {
         LOG(INFO) << "Already initialized";
@@ -345,13 +349,13 @@ bool e4crypt_initialize_global_de() {
     get_data_file_encryption_modes(&device_ref);
 
     std::string modestring = device_ref.contents_mode + ":" + device_ref.filenames_mode;
-    std::string mode_filename = std::string("/data") + e4crypt_key_mode;
+    std::string mode_filename = std::string("/data") + fscrypt_key_mode;
     if (!android::base::WriteStringToFile(modestring, mode_filename)) {
         PLOG(ERROR) << "Cannot save type";
         return false;
     }
 
-    std::string ref_filename = std::string("/data") + e4crypt_key_ref;
+    std::string ref_filename = std::string("/data") + fscrypt_key_ref;
     if (!android::base::WriteStringToFile(device_ref.key_raw_ref, ref_filename)) {
         PLOG(ERROR) << "Cannot save key reference to:" << ref_filename;
         return false;
@@ -362,9 +366,9 @@ bool e4crypt_initialize_global_de() {
     return true;
 }
 
-bool e4crypt_init_user0() {
-    LOG(DEBUG) << "e4crypt_init_user0";
-    if (e4crypt_is_native()) {
+bool fscrypt_init_user0() {
+    LOG(DEBUG) << "fscrypt_init_user0";
+    if (fscrypt_is_native()) {
         if (!prepare_dir(user_key_dir, 0700, AID_ROOT, AID_ROOT)) return false;
         if (!prepare_dir(user_key_dir + "/ce", 0700, AID_ROOT, AID_ROOT)) return false;
         if (!prepare_dir(user_key_dir + "/de", 0700, AID_ROOT, AID_ROOT)) return false;
@@ -378,28 +382,28 @@ bool e4crypt_init_user0() {
     // We can only safely prepare DE storage here, since CE keys are probably
     // entangled with user credentials.  The framework will always prepare CE
     // storage once CE keys are installed.
-    if (!e4crypt_prepare_user_storage("", 0, 0, android::os::IVold::STORAGE_FLAG_DE)) {
+    if (!fscrypt_prepare_user_storage("", 0, 0, android::os::IVold::STORAGE_FLAG_DE)) {
         LOG(ERROR) << "Failed to prepare user 0 storage";
         return false;
     }
 
     // If this is a non-FBE device that recently left an emulated mode,
     // restore user data directories to known-good state.
-    if (!e4crypt_is_native() && !e4crypt_is_emulated()) {
-        e4crypt_unlock_user_key(0, 0, "!", "!");
+    if (!fscrypt_is_native() && !fscrypt_is_emulated()) {
+        fscrypt_unlock_user_key(0, 0, "!", "!");
     }
 
     return true;
 }
 
-bool e4crypt_vold_create_user_key(userid_t user_id, int serial, bool ephemeral) {
-    LOG(DEBUG) << "e4crypt_vold_create_user_key for " << user_id << " serial " << serial;
-    if (!e4crypt_is_native()) {
+bool fscrypt_vold_create_user_key(userid_t user_id, int serial, bool ephemeral) {
+    LOG(DEBUG) << "fscrypt_vold_create_user_key for " << user_id << " serial " << serial;
+    if (!fscrypt_is_native()) {
         return true;
     }
     // FIXME test for existence of key that is not loaded yet
     if (s_ce_key_raw_refs.count(user_id) != 0) {
-        LOG(ERROR) << "Already exists, can't e4crypt_vold_create_user_key for " << user_id
+        LOG(ERROR) << "Already exists, can't fscrypt_vold_create_user_key for " << user_id
                    << " serial " << serial;
         // FIXME should we fail the command?
         return true;
@@ -432,22 +436,22 @@ static bool evict_ce_key(userid_t user_id) {
     return success;
 }
 
-bool e4crypt_destroy_user_key(userid_t user_id) {
-    LOG(DEBUG) << "e4crypt_destroy_user_key(" << user_id << ")";
-    if (!e4crypt_is_native()) {
+bool fscrypt_destroy_user_key(userid_t user_id) {
+    LOG(DEBUG) << "fscrypt_destroy_user_key(" << user_id << ")";
+    if (!fscrypt_is_native()) {
         return true;
     }
     bool success = true;
     std::string raw_ref;
     success &= evict_ce_key(user_id);
-    success &= lookup_key_ref(s_de_key_raw_refs, user_id, &raw_ref)
-        && android::vold::evictKey(raw_ref);
+    success &=
+        lookup_key_ref(s_de_key_raw_refs, user_id, &raw_ref) && android::vold::evictKey(raw_ref);
     s_de_key_raw_refs.erase(user_id);
     auto it = s_ephemeral_users.find(user_id);
     if (it != s_ephemeral_users.end()) {
         s_ephemeral_users.erase(it);
     } else {
-        for (auto const path: get_ce_key_paths(get_ce_key_directory_path(user_id))) {
+        for (auto const path : get_ce_key_paths(get_ce_key_directory_path(user_id))) {
             success &= android::vold::destroyKey(path);
         }
         auto de_key_path = get_de_key_path(user_id);
@@ -478,13 +482,13 @@ static bool emulated_unlock(const std::string& path, mode_t mode) {
     if (chmod(path.c_str(), mode) != 0) {
         PLOG(ERROR) << "Failed to chmod " << path;
         // FIXME temporary workaround for b/26713622
-        if (e4crypt_is_emulated()) return false;
+        if (fscrypt_is_emulated()) return false;
     }
 #if EMULATED_USES_SELINUX
     if (selinux_android_restorecon(path.c_str(), SELINUX_ANDROID_RESTORECON_FORCE) != 0) {
         PLOG(WARNING) << "Failed to restorecon " << path;
         // FIXME temporary workaround for b/26713622
-        if (e4crypt_is_emulated()) return false;
+        if (fscrypt_is_emulated()) return false;
     }
 #endif
     return true;
@@ -547,34 +551,35 @@ static bool destroy_volkey(const std::string& misc_path, const std::string& volu
     return android::vold::destroyKey(path);
 }
 
-bool e4crypt_add_user_key_auth(userid_t user_id, int serial, const std::string& token_hex,
+bool fscrypt_add_user_key_auth(userid_t user_id, int serial, const std::string& token_hex,
                                const std::string& secret_hex) {
-    LOG(DEBUG) << "e4crypt_add_user_key_auth " << user_id << " serial=" << serial
+    LOG(DEBUG) << "fscrypt_add_user_key_auth " << user_id << " serial=" << serial
                << " token_present=" << (token_hex != "!");
-    if (!e4crypt_is_native()) return true;
+    if (!fscrypt_is_native()) return true;
     if (s_ephemeral_users.count(user_id) != 0) return true;
     std::string token, secret;
     if (!parse_hex(token_hex, &token)) return false;
     if (!parse_hex(secret_hex, &secret)) return false;
-    auto auth = secret.empty() ? kEmptyAuthentication
-                                   : android::vold::KeyAuthentication(token, secret);
+    auto auth =
+        secret.empty() ? kEmptyAuthentication : android::vold::KeyAuthentication(token, secret);
     auto it = s_ce_keys.find(user_id);
     if (it == s_ce_keys.end()) {
         LOG(ERROR) << "Key not loaded into memory, can't change for user " << user_id;
         return false;
     }
-    const auto &ce_key = it->second;
+    const auto& ce_key = it->second;
     auto const directory_path = get_ce_key_directory_path(user_id);
     auto const paths = get_ce_key_paths(directory_path);
     std::string ce_key_path;
     if (!get_ce_key_new_path(directory_path, paths, &ce_key_path)) return false;
     if (!android::vold::storeKeyAtomically(ce_key_path, user_key_temp, auth, ce_key)) return false;
+    if (!android::vold::FsyncDirectory(directory_path)) return false;
     return true;
 }
 
-bool e4crypt_fixate_newest_user_key_auth(userid_t user_id) {
-    LOG(DEBUG) << "e4crypt_fixate_newest_user_key_auth " << user_id;
-    if (!e4crypt_is_native()) return true;
+bool fscrypt_fixate_newest_user_key_auth(userid_t user_id) {
+    LOG(DEBUG) << "fscrypt_fixate_newest_user_key_auth " << user_id;
+    if (!fscrypt_is_native()) return true;
     if (s_ephemeral_users.count(user_id) != 0) return true;
     auto const directory_path = get_ce_key_directory_path(user_id);
     auto const paths = get_ce_key_paths(directory_path);
@@ -587,11 +592,11 @@ bool e4crypt_fixate_newest_user_key_auth(userid_t user_id) {
 }
 
 // TODO: rename to 'install' for consistency, and take flags to know which keys to install
-bool e4crypt_unlock_user_key(userid_t user_id, int serial, const std::string& token_hex,
+bool fscrypt_unlock_user_key(userid_t user_id, int serial, const std::string& token_hex,
                              const std::string& secret_hex) {
-    LOG(DEBUG) << "e4crypt_unlock_user_key " << user_id << " serial=" << serial
+    LOG(DEBUG) << "fscrypt_unlock_user_key " << user_id << " serial=" << serial
                << " token_present=" << (token_hex != "!");
-    if (e4crypt_is_native()) {
+    if (fscrypt_is_native()) {
         if (s_ce_key_raw_refs.count(user_id) != 0) {
             LOG(WARNING) << "Tried to unlock already-unlocked key for user " << user_id;
             return true;
@@ -620,11 +625,11 @@ bool e4crypt_unlock_user_key(userid_t user_id, int serial, const std::string& to
 }
 
 // TODO: rename to 'evict' for consistency
-bool e4crypt_lock_user_key(userid_t user_id) {
-    LOG(DEBUG) << "e4crypt_lock_user_key " << user_id;
-    if (e4crypt_is_native()) {
+bool fscrypt_lock_user_key(userid_t user_id) {
+    LOG(DEBUG) << "fscrypt_lock_user_key " << user_id;
+    if (fscrypt_is_native()) {
         return evict_ce_key(user_id);
-    } else if (e4crypt_is_emulated()) {
+    } else if (fscrypt_is_emulated()) {
         // When in emulation mode, we just use chmod
         if (!emulated_lock(android::vold::BuildDataSystemCePath(user_id)) ||
             !emulated_lock(android::vold::BuildDataMiscCePath(user_id)) ||
@@ -649,9 +654,9 @@ static bool prepare_subdirs(const std::string& action, const std::string& volume
     return true;
 }
 
-bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_id, int serial,
+bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_id, int serial,
                                   int flags) {
-    LOG(DEBUG) << "e4crypt_prepare_user_storage for volume " << escape_empty(volume_uuid)
+    LOG(DEBUG) << "fscrypt_prepare_user_storage for volume " << escape_empty(volume_uuid)
                << ", user " << user_id << ", serial " << serial << ", flags " << flags;
 
     if (flags & android::os::IVold::STORAGE_FLAG_DE) {
@@ -670,7 +675,8 @@ bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
             if (!prepare_dir(system_legacy_path, 0700, AID_SYSTEM, AID_SYSTEM)) return false;
 #if MANAGE_MISC_DIRS
             if (!prepare_dir(misc_legacy_path, 0750, multiuser_get_uid(user_id, AID_SYSTEM),
-                    multiuser_get_uid(user_id, AID_EVERYBODY))) return false;
+                             multiuser_get_uid(user_id, AID_EVERYBODY)))
+                return false;
 #endif
             if (!prepare_dir(profiles_de_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
@@ -680,7 +686,7 @@ bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         }
         if (!prepare_dir(user_de_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
-        if (e4crypt_is_native()) {
+        if (fscrypt_is_native()) {
             PolicyKeyRef de_ref;
             if (volume_uuid.empty()) {
                 if (!lookup_key_ref(s_de_key_raw_refs, user_id, &de_ref.key_raw_ref)) return false;
@@ -711,7 +717,7 @@ bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         if (!prepare_dir(media_ce_path, 0770, AID_MEDIA_RW, AID_MEDIA_RW)) return false;
         if (!prepare_dir(user_ce_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
-        if (e4crypt_is_native()) {
+        if (fscrypt_is_native()) {
             PolicyKeyRef ce_ref;
             if (volume_uuid.empty()) {
                 if (!lookup_key_ref(s_ce_key_raw_refs, user_id, &ce_ref.key_raw_ref)) return false;
@@ -740,8 +746,8 @@ bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
     return true;
 }
 
-bool e4crypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_id, int flags) {
-    LOG(DEBUG) << "e4crypt_destroy_user_storage for volume " << escape_empty(volume_uuid)
+bool fscrypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_id, int flags) {
+    LOG(DEBUG) << "fscrypt_destroy_user_storage for volume " << escape_empty(volume_uuid)
                << ", user " << user_id << ", flags " << flags;
     bool res = true;
 
@@ -762,7 +768,7 @@ bool e4crypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_
             res &= destroy_dir(misc_ce_path);
             res &= destroy_dir(vendor_ce_path);
         } else {
-            if (e4crypt_is_native()) {
+            if (fscrypt_is_native()) {
                 res &= destroy_volkey(misc_ce_path, volume_uuid);
             }
         }
@@ -791,7 +797,7 @@ bool e4crypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_
             res &= destroy_dir(misc_de_path);
             res &= destroy_dir(vendor_de_path);
         } else {
-            if (e4crypt_is_native()) {
+            if (fscrypt_is_native()) {
                 res &= destroy_volkey(misc_de_path, volume_uuid);
             }
         }
@@ -826,9 +832,9 @@ static bool destroy_volume_keys(const std::string& directory_path, const std::st
     return res;
 }
 
-bool e4crypt_destroy_volume_keys(const std::string& volume_uuid) {
+bool fscrypt_destroy_volume_keys(const std::string& volume_uuid) {
     bool res = true;
-    LOG(DEBUG) << "e4crypt_destroy_volume_keys for volume " << escape_empty(volume_uuid);
+    LOG(DEBUG) << "fscrypt_destroy_volume_keys for volume " << escape_empty(volume_uuid);
     auto secdiscardable_path = volume_secdiscardable_path(volume_uuid);
     res &= android::vold::runSecdiscardSingle(secdiscardable_path);
     res &= destroy_volume_keys("/data/misc_ce", volume_uuid);

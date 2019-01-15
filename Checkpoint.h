@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,31 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_VOLD_VFAT_H
-#define ANDROID_VOLD_VFAT_H
+#ifndef _CHECKPOINT_H
+#define _CHECKPOINT_H
 
-#include <utils/Errors.h>
-
+#include <binder/Status.h>
 #include <string>
 
 namespace android {
 namespace vold {
-namespace vfat {
 
-bool IsSupported();
+android::binder::Status cp_startCheckpoint(int retry);
 
-status_t Check(const std::string& source);
-status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
-               bool executable, int ownerUid, int ownerGid, int permMask, bool createLost);
-status_t Format(const std::string& source, unsigned long numSectors);
+android::binder::Status cp_commitChanges();
 
-}  // namespace vfat
+android::binder::Status cp_abortChanges();
+
+bool cp_needsRollback();
+
+bool cp_needsCheckpoint();
+
+android::binder::Status cp_prepareCheckpoint();
+
+android::binder::Status cp_restoreCheckpoint(const std::string& mountPoint);
+
+android::binder::Status cp_markBootAttempt();
+
 }  // namespace vold
 }  // namespace android
 
