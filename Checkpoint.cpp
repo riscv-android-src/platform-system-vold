@@ -39,6 +39,9 @@
 
 using android::base::SetProperty;
 using android::binder::Status;
+using android::fs_mgr::Fstab;
+using android::fs_mgr::ReadDefaultFstab;
+using android::fs_mgr::ReadFstabFromFile;
 using android::hardware::hidl_string;
 using android::hardware::boot::V1_0::BoolResult;
 using android::hardware::boot::V1_0::IBootControl;
@@ -66,6 +69,22 @@ bool setBowState(std::string const& block_device, std::string const& state) {
 }
 
 }  // namespace
+
+Status cp_supportsCheckpoint(bool& result) {
+    result = false;
+    Fstab fstab_default;
+    if (!ReadDefaultFstab(&fstab_default)) {
+        return Status::fromExceptionCode(EINVAL, "Failed to get fstab");
+    }
+
+    for (const auto& entry : fstab_default) {
+        if (entry.fs_mgr_flags.checkpoint_blk || entry.fs_mgr_flags.checkpoint_fs) {
+            result = true;
+            return Status::ok();
+        }
+    }
+    return Status::ok();
+}
 
 Status cp_startCheckpoint(int retry) {
     if (retry < -1) return Status::fromExceptionCode(EINVAL, "Retry count must be more than -1");
@@ -97,30 +116,31 @@ Status cp_commitChanges() {
     // But we also need to get the matching fstab entries to see
     // the original flags
     std::string err_str;
-    auto fstab_default = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
-        fs_mgr_read_fstab_default(), fs_mgr_free_fstab};
-    if (!fstab_default) return Status::fromExceptionCode(EINVAL, "Failed to get fstab");
+    Fstab fstab_default;
+    if (!ReadDefaultFstab(&fstab_default)) {
+        return Status::fromExceptionCode(EINVAL, "Failed to get fstab");
+    }
 
-    auto mounts = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
-        fs_mgr_read_fstab("/proc/mounts"), fs_mgr_free_fstab};
-    if (!mounts) return Status::fromExceptionCode(EINVAL, "Failed to get /proc/mounts");
+    Fstab mounts;
+    if (!ReadFstabFromFile("/proc/mounts", &mounts)) {
+        return Status::fromExceptionCode(EINVAL, "Failed to get /proc/mounts");
+    }
 
     // Walk mounted file systems
-    for (int i = 0; i < mounts->num_entries; ++i) {
-        const fstab_rec* mount_rec = &mounts->recs[i];
-        const fstab_rec* fstab_rec =
-            fs_mgr_get_entry_for_mount_point(fstab_default.get(), mount_rec->mount_point);
+    for (const auto& mount_rec : mounts) {
+        const auto fstab_rec = GetEntryForMountPoint(&fstab_default, mount_rec.mount_point);
         if (!fstab_rec) continue;
 
-        if (fs_mgr_is_checkpoint_fs(fstab_rec)) {
-            if (!strcmp(fstab_rec->fs_type, "f2fs")) {
-                if (mount(mount_rec->blk_device, mount_rec->mount_point, "none",
-                          MS_REMOUNT | fstab_rec->flags, "checkpoint=enable")) {
+        if (fstab_rec->fs_mgr_flags.checkpoint_fs) {
+            if (fstab_rec->fs_type == "f2fs") {
+                std::string options = mount_rec.fs_options + ",checkpoint=enable";
+                if (mount(mount_rec.blk_device.c_str(), mount_rec.mount_point.c_str(), "none",
+                          MS_REMOUNT | fstab_rec->flags, options.c_str())) {
                     return Status::fromExceptionCode(EINVAL, "Failed to remount");
                 }
             }
-        } else if (fs_mgr_is_checkpoint_blk(fstab_rec)) {
-            if (!setBowState(mount_rec->blk_device, "2"))
+        } else if (fstab_rec->fs_mgr_flags.checkpoint_blk) {
+            if (!setBowState(mount_rec.blk_device, "2"))
                 return Status::fromExceptionCode(EINVAL, "Failed to set bow state");
         }
     }
@@ -177,36 +197,36 @@ bool cp_needsCheckpoint() {
 }
 
 Status cp_prepareCheckpoint() {
-    auto fstab_default = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
-        fs_mgr_read_fstab_default(), fs_mgr_free_fstab};
-    if (!fstab_default) return Status::fromExceptionCode(EINVAL, "Failed to get fstab");
+    Fstab fstab_default;
+    if (!ReadDefaultFstab(&fstab_default)) {
+        return Status::fromExceptionCode(EINVAL, "Failed to get fstab");
+    }
 
-    auto mounts = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
-        fs_mgr_read_fstab("/proc/mounts"), fs_mgr_free_fstab};
-    if (!mounts) return Status::fromExceptionCode(EINVAL, "Failed to get /proc/mounts");
+    Fstab mounts;
+    if (!ReadFstabFromFile("/proc/mounts", &mounts)) {
+        return Status::fromExceptionCode(EINVAL, "Failed to get /proc/mounts");
+    }
 
-    for (int i = 0; i < mounts->num_entries; ++i) {
-        const fstab_rec* mount_rec = &mounts->recs[i];
-        const fstab_rec* fstab_rec =
-            fs_mgr_get_entry_for_mount_point(fstab_default.get(), mount_rec->mount_point);
+    for (const auto& mount_rec : mounts) {
+        const auto fstab_rec = GetEntryForMountPoint(&fstab_default, mount_rec.mount_point);
         if (!fstab_rec) continue;
 
-        if (fs_mgr_is_checkpoint_blk(fstab_rec)) {
+        if (fstab_rec->fs_mgr_flags.checkpoint_blk) {
             android::base::unique_fd fd(
-                TEMP_FAILURE_RETRY(open(mount_rec->mount_point, O_RDONLY | O_CLOEXEC)));
+                TEMP_FAILURE_RETRY(open(mount_rec.mount_point.c_str(), O_RDONLY | O_CLOEXEC)));
             if (!fd) {
-                PLOG(ERROR) << "Failed to open mount point" << mount_rec->mount_point;
+                PLOG(ERROR) << "Failed to open mount point" << mount_rec.mount_point;
                 continue;
             }
 
             struct fstrim_range range = {};
             range.len = ULLONG_MAX;
             if (ioctl(fd, FITRIM, &range)) {
-                PLOG(ERROR) << "Failed to trim " << mount_rec->mount_point;
+                PLOG(ERROR) << "Failed to trim " << mount_rec.mount_point;
                 continue;
             }
 
-            setBowState(mount_rec->blk_device, "1");
+            setBowState(mount_rec.blk_device, "1");
         }
     }
     return Status::ok();
@@ -229,6 +249,7 @@ struct log_sector {
     uint32_t magic;
     uint32_t count;
     uint32_t sequence;
+    uint64_t sector0;
     struct log_entry entries[];
 } __attribute__((packed));
 
@@ -289,62 +310,119 @@ void crc32(const void* data, size_t n_bytes, uint32_t* crc) {
 
 }  // namespace
 
+static void read(std::fstream& device, std::vector<log_entry> const& logs, sector_t sector,
+                 char* buffer) {
+    for (auto l = logs.rbegin(); l != logs.rend(); l++)
+        if (sector >= l->source && (sector - l->source) * kSectorSize < l->size)
+            sector = sector - l->source + l->dest;
+
+    device.seekg(sector * kSectorSize);
+    device.read(buffer, kBlockSize);
+}
+
+static std::vector<char> read(std::fstream& device, std::vector<log_entry> const& logs,
+                              bool validating, sector_t sector, uint32_t size) {
+    if (!validating) {
+        std::vector<char> buffer(size);
+        device.seekg(sector * kSectorSize);
+        device.read(&buffer[0], size);
+        return buffer;
+    }
+
+    // Crude approach at first where we do this sector by sector and just scan
+    // the entire logs for remappings each time
+    std::vector<char> buffer(size);
+
+    for (uint32_t i = 0; i < size; i += kBlockSize, sector += kBlockSize / kSectorSize)
+        read(device, logs, sector, &buffer[i]);
+
+    return buffer;
+}
+
 Status cp_restoreCheckpoint(const std::string& blockDevice) {
-    LOG(INFO) << "Restoring checkpoint on " << blockDevice;
-    std::fstream device(blockDevice, std::ios::binary | std::ios::in | std::ios::out);
-    if (!device) {
-        PLOG(ERROR) << "Cannot open " << blockDevice;
-        return Status::fromExceptionCode(errno, ("Cannot open " + blockDevice).c_str());
-    }
-    alignas(alignof(log_sector)) char ls_buffer[kBlockSize];
-    device.read(ls_buffer, kBlockSize);
-    log_sector& ls = *reinterpret_cast<log_sector*>(ls_buffer);
-    if (ls.magic != kMagic) {
-        LOG(ERROR) << "No magic";
-        return Status::fromExceptionCode(EINVAL, "No magic");
-    }
+    bool validating = true;
+    std::string action = "Validating";
 
-    LOG(INFO) << "Restoring " << ls.sequence << " log sectors";
+    for (;;) {
+        std::vector<log_entry> logs;
+        Status status = Status::ok();
 
-    for (int sequence = ls.sequence; sequence >= 0; sequence--) {
-        device.seekg(0);
-        device.read(ls_buffer, kBlockSize);
-        ls = *reinterpret_cast<log_sector*>(ls_buffer);
+        LOG(INFO) << action << " checkpoint on " << blockDevice;
+        std::fstream device(blockDevice, std::ios::binary | std::ios::in | std::ios::out);
+        if (!device) {
+            PLOG(ERROR) << "Cannot open " << blockDevice;
+            return Status::fromExceptionCode(errno, ("Cannot open " + blockDevice).c_str());
+        }
+        auto buffer = read(device, logs, validating, 0, kBlockSize);
+        log_sector& ls = *reinterpret_cast<log_sector*>(&buffer[0]);
         if (ls.magic != kMagic) {
-            LOG(ERROR) << "No magic!";
+            LOG(ERROR) << "No magic";
             return Status::fromExceptionCode(EINVAL, "No magic");
         }
 
-        if ((int)ls.sequence != sequence) {
-            LOG(ERROR) << "Expecting log sector " << sequence << " but got " << ls.sequence;
-            return Status::fromExceptionCode(
-                EINVAL, ("Expecting log sector " + std::to_string(sequence) + " but got " +
-                         std::to_string(ls.sequence))
-                            .c_str());
-        }
+        LOG(INFO) << action << " " << ls.sequence << " log sectors";
 
-        LOG(INFO) << "Restoring from log sector " << ls.sequence;
-
-        for (log_entry* le = &ls.entries[ls.count - 1]; le >= ls.entries; --le) {
-            LOG(INFO) << "Restoring " << le->size << " bytes from sector " << le->dest << " to "
-                      << le->source << " with checksum " << std::hex << le->checksum;
-            std::vector<char> buffer(le->size);
-            device.seekg(le->dest * kSectorSize);
-            device.read(&buffer[0], le->size);
-
-            uint32_t checksum = le->source / (kBlockSize / kSectorSize);
-            for (size_t i = 0; i < le->size; i += kBlockSize) {
-                crc32(&buffer[i], kBlockSize, &checksum);
+        for (int sequence = ls.sequence; sequence >= 0 && status.isOk(); sequence--) {
+            auto buffer = read(device, logs, validating, 0, kBlockSize);
+            log_sector& ls = *reinterpret_cast<log_sector*>(&buffer[0]);
+            if (ls.magic != kMagic) {
+                LOG(ERROR) << "No magic!";
+                status = Status::fromExceptionCode(EINVAL, "No magic");
+                break;
             }
 
-            if (le->checksum && checksum != le->checksum) {
-                LOG(ERROR) << "Checksums don't match " << std::hex << checksum;
-                return Status::fromExceptionCode(EINVAL, "Checksums don't match");
+            if ((int)ls.sequence != sequence) {
+                LOG(ERROR) << "Expecting log sector " << sequence << " but got " << ls.sequence;
+                status = Status::fromExceptionCode(
+                    EINVAL, ("Expecting log sector " + std::to_string(sequence) + " but got " +
+                             std::to_string(ls.sequence))
+                                .c_str());
+                break;
             }
 
-            device.seekg(le->source * kSectorSize);
-            device.write(&buffer[0], le->size);
+            LOG(INFO) << action << " from log sector " << ls.sequence;
+
+            for (log_entry* le = &ls.entries[ls.count - 1]; le >= ls.entries; --le) {
+                LOG(INFO) << action << " " << le->size << " bytes from sector " << le->dest
+                          << " to " << le->source << " with checksum " << std::hex << le->checksum;
+                auto buffer = read(device, logs, validating, le->dest, le->size);
+                uint32_t checksum = le->source / (kBlockSize / kSectorSize);
+                for (size_t i = 0; i < le->size; i += kBlockSize) {
+                    crc32(&buffer[i], kBlockSize, &checksum);
+                }
+
+                if (le->checksum && checksum != le->checksum) {
+                    LOG(ERROR) << "Checksums don't match " << std::hex << checksum;
+                    status = Status::fromExceptionCode(EINVAL, "Checksums don't match");
+                    break;
+                }
+
+                logs.push_back(*le);
+
+                if (!validating) {
+                    device.seekg(le->source * kSectorSize);
+                    device.write(&buffer[0], le->size);
+                }
+            }
         }
+
+        if (!status.isOk()) {
+            if (!validating) {
+                LOG(ERROR) << "Checkpoint restore failed even though checkpoint validation passed";
+                return status;
+            }
+
+            LOG(WARNING) << "Checkpoint validation failed - attempting to roll forward";
+            auto buffer = read(device, logs, false, ls.sector0, kBlockSize);
+            device.seekg(0);
+            device.write(&buffer[0], kBlockSize);
+            return Status::ok();
+        }
+
+        if (!validating) break;
+
+        validating = false;
+        action = "Restoring";
     }
 
     return Status::ok();
