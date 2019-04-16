@@ -152,6 +152,7 @@ static void parse_args(int argc, char** argv) {
         {"blkid_untrusted_context", required_argument, 0, 'B'},
         {"fsck_context", required_argument, 0, 'f'},
         {"fsck_untrusted_context", required_argument, 0, 'F'},
+        {nullptr, 0, nullptr, 0},
     };
 
     int c;
@@ -226,12 +227,17 @@ static int process_config(VolumeManager* vm, bool* has_adoptable, bool* has_quot
     *has_adoptable = false;
     *has_quota = false;
     *has_reserved = false;
-    for (const auto& entry : fstab_default) {
+    for (auto& entry : fstab_default) {
         if (entry.fs_mgr_flags.quota) {
             *has_quota = true;
         }
         if (entry.reserved_size > 0) {
             *has_reserved = true;
+        }
+
+        /* Make sure logical partitions have an updated blk_device. */
+        if (entry.fs_mgr_flags.logical && !fs_mgr_update_logical_partition(&entry)) {
+            PLOG(FATAL) << "could not find logical partition " << entry.blk_device;
         }
 
         if (entry.fs_mgr_flags.vold_managed) {
