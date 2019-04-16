@@ -60,10 +60,10 @@
 #include <android-base/unique_fd.h>
 
 using android::base::StringPrintf;
-using android::base::WriteStringToFile;
 using android::fs_mgr::GetEntryForMountPoint;
 using android::vold::kEmptyAuthentication;
 using android::vold::KeyBuffer;
+using android::vold::writeStringToFile;
 
 namespace {
 
@@ -351,18 +351,14 @@ bool fscrypt_initialize_global_de() {
 
     std::string modestring = device_ref.contents_mode + ":" + device_ref.filenames_mode;
     std::string mode_filename = std::string("/data") + fscrypt_key_mode;
-    if (!android::base::WriteStringToFile(modestring, mode_filename)) {
-        PLOG(ERROR) << "Cannot save type";
-        return false;
-    }
+    if (!android::vold::writeStringToFile(modestring, mode_filename)) return false;
 
     std::string ref_filename = std::string("/data") + fscrypt_key_ref;
-    if (!android::base::WriteStringToFile(device_ref.key_raw_ref, ref_filename)) {
-        PLOG(ERROR) << "Cannot save key reference to:" << ref_filename;
-        return false;
-    }
+    if (!android::vold::writeStringToFile(device_ref.key_raw_ref, ref_filename)) return false;
+
     LOG(INFO) << "Wrote system DE key reference to:" << ref_filename;
 
+    if (!android::vold::FsyncDirectory(device_key_dir)) return false;
     s_global_de_initialized = true;
     return true;
 }
@@ -415,11 +411,18 @@ bool fscrypt_vold_create_user_key(userid_t user_id, int serial, bool ephemeral) 
     return true;
 }
 
+// "Lock" all encrypted directories whose key has been removed.  This is needed
+// because merely removing the keyring key doesn't affect inodes in the kernel's
+// inode cache whose per-file key was already set up.  So to remove the per-file
+// keys and make the files "appear encrypted", these inodes must be evicted.
+//
+// To do this, sync() to clean all dirty inodes, then drop all reclaimable slab
+// objects systemwide.  This is overkill, but it's the best available method
+// currently.  Don't use drop_caches mode "3" because that also evicts pagecache
+// for in-use files; all files relevant here are already closed and sync'ed.
 static void drop_caches() {
-    // Clean any dirty pages (otherwise they won't be dropped).
     sync();
-    // Drop inode and page caches.
-    if (!WriteStringToFile("3", "/proc/sys/vm/drop_caches")) {
+    if (!writeStringToFile("2", "/proc/sys/vm/drop_caches")) {
         PLOG(ERROR) << "Failed to drop caches during key eviction";
     }
 }
