@@ -72,14 +72,11 @@ binder::Status error(int error, const std::string& msg) {
 }
 
 bool setBowState(std::string const& block_device, std::string const& state) {
-    if (block_device.substr(0, 5) != "/dev/") {
-        LOG(ERROR) << "Expected block device, got " << block_device;
-        return false;
-    }
+    std::string bow_device = fs_mgr_find_bow_device(block_device);
+    if (bow_device.empty()) return false;
 
-    std::string state_filename = std::string("/sys/") + block_device.substr(5) + "/bow/state";
-    if (!android::base::WriteStringToFile(state, state_filename)) {
-        PLOG(ERROR) << "Failed to write to file " << state_filename;
+    if (!android::base::WriteStringToFile(state, bow_device + "/bow/state")) {
+        PLOG(ERROR) << "Failed to write to file " << bow_device + "/bow/state";
         return false;
     }
 
@@ -125,6 +122,10 @@ Status cp_supportsFileCheckpoint(bool& result) {
 }
 
 Status cp_startCheckpoint(int retry) {
+    bool result;
+    if (!cp_supportsCheckpoint(result).isOk() || !result)
+        return error(ENOTSUP, "Checkpoints not supported");
+
     if (retry < -1) return error(EINVAL, "Retry count must be more than -1");
     std::string content = std::to_string(retry + 1);
     if (retry == -1) {
@@ -147,6 +148,11 @@ volatile bool isCheckpointing = false;
 
 Status cp_commitChanges() {
     if (!isCheckpointing) {
+        return Status::ok();
+    }
+    if (android::base::GetProperty("persist.vold.dont_commit_checkpoint", "0") == "1") {
+        LOG(WARNING)
+            << "NOT COMMITTING CHECKPOINT BECAUSE persist.vold.dont_commit_checkpoint IS 1";
         return Status::ok();
     }
     sp<IBootControl> module = IBootControl::getService();
@@ -283,7 +289,6 @@ const bool commit_on_full_default = true;
 
 static void cp_healthDaemon(std::string mnt_pnt, std::string blk_device, bool is_fs_cp) {
     struct statvfs data;
-    uint64_t free_bytes = 0;
     uint32_t msleeptime = GetUintProperty(kSleepTimeProp, msleeptime_default, max_msleeptime);
     uint64_t min_free_bytes =
         GetUintProperty(kMinFreeBytesProp, min_free_bytes_default, (uint64_t)-1);
@@ -294,16 +299,17 @@ static void cp_healthDaemon(std::string mnt_pnt, std::string blk_device, bool is
     msleeptime %= 1000;
     req.tv_nsec = msleeptime * 1000000;
     while (isCheckpointing) {
+        uint64_t free_bytes = 0;
         if (is_fs_cp) {
             statvfs(mnt_pnt.c_str(), &data);
             free_bytes = data.f_bavail * data.f_frsize;
         } else {
-            int ret;
-            std::string size_filename = std::string("/sys/") + blk_device.substr(5) + "/bow/free";
-            std::string content;
-            ret = android::base::ReadFileToString(size_filename, &content);
-            if (ret) {
-                free_bytes = std::strtoul(content.c_str(), NULL, 10);
+            std::string bow_device = fs_mgr_find_bow_device(blk_device);
+            if (!bow_device.empty()) {
+                std::string content;
+                if (android::base::ReadFileToString(bow_device + "/bow/free", &content)) {
+                    free_bytes = std::strtoul(content.c_str(), NULL, 10);
+                }
             }
         }
         if (free_bytes < min_free_bytes) {
