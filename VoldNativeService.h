@@ -112,6 +112,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
 
     binder::Status addUserKeyAuth(int32_t userId, int32_t userSerial, const std::string& token,
                                   const std::string& secret);
+    binder::Status clearUserKeyAuth(int32_t userId, int32_t userSerial, const std::string& token,
+                                    const std::string& secret);
     binder::Status fixateNewestUserKeyAuth(int32_t userId);
 
     binder::Status unlockUserKey(int32_t userId, int32_t userSerial, const std::string& token,
@@ -140,6 +142,14 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status supportsCheckpoint(bool* _aidl_return);
     binder::Status supportsBlockCheckpoint(bool* _aidl_return);
     binder::Status supportsFileCheckpoint(bool* _aidl_return);
+    binder::Status resetCheckpoint();
+
+    binder::Status incFsVersion(int32_t* _aidl_return) override;
+    binder::Status mountIncFs(
+            const std::string& imagePath, const std::string& targetDir, int32_t flags,
+            ::android::os::incremental::IncrementalFileSystemControlParcel* _aidl_return) override;
+    binder::Status unmountIncFs(const std::string& dir) override;
+    binder::Status bindMount(const std::string& sourceDir, const std::string& targetDir) override;
 };
 
 }  // namespace vold

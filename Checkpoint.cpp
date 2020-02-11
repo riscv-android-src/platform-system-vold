@@ -145,8 +145,10 @@ namespace {
 
 volatile bool isCheckpointing = false;
 
-// Protects isCheckpointing and code that makes decisions based on status of
-// isCheckpointing
+volatile bool needsCheckpointWasCalled = false;
+
+// Protects isCheckpointing, needsCheckpointWasCalled and code that makes decisions based on status
+// of isCheckpointing
 std::mutex isCheckpointingLock;
 }
 
@@ -168,6 +170,10 @@ Status cp_commitChanges() {
         if (!cr.success)
             return error(EINVAL, "Error marking booted successfully: " + std::string(cr.errMsg));
         LOG(INFO) << "Marked slot as booted successfully.";
+        // Clears the warm reset flag for next reboot.
+        if (!SetProperty("ota.warm_reset", "0")) {
+            LOG(WARNING) << "Failed to reset the warm reset flag";
+        }
     }
     // Must take action for list of mounted checkpointed things here
     // To do this, we walk the list of mounted file systems.
@@ -263,16 +269,16 @@ bool cp_needsRollback() {
 }
 
 bool cp_needsCheckpoint() {
+    std::lock_guard<std::mutex> lock(isCheckpointingLock);
+
     // Make sure we only return true during boot. See b/138952436 for discussion
-    static bool called_once = false;
-    if (called_once) return isCheckpointing;
-    called_once = true;
+    if (needsCheckpointWasCalled) return isCheckpointing;
+    needsCheckpointWasCalled = true;
 
     bool ret;
     std::string content;
     sp<IBootControl> module = IBootControl::getService();
 
-    std::lock_guard<std::mutex> lock(isCheckpointingLock);
     if (isCheckpointing) return isCheckpointing;
 
     if (module && module->isSlotMarkedSuccessful(module->getCurrentSlot()) == BoolResult::FALSE) {
@@ -314,13 +320,13 @@ static void cp_healthDaemon(std::string mnt_pnt, std::string blk_device, bool is
         uint64_t free_bytes = 0;
         if (is_fs_cp) {
             statvfs(mnt_pnt.c_str(), &data);
-            free_bytes = data.f_bavail * data.f_frsize;
+            free_bytes = ((uint64_t) data.f_bavail) * data.f_frsize;
         } else {
             std::string bow_device = fs_mgr_find_bow_device(blk_device);
             if (!bow_device.empty()) {
                 std::string content;
                 if (android::base::ReadFileToString(bow_device + "/bow/free", &content)) {
-                    free_bytes = std::strtoul(content.c_str(), NULL, 10);
+                    free_bytes = std::strtoull(content.c_str(), NULL, 10);
                 }
             }
         }
@@ -342,6 +348,8 @@ static void cp_healthDaemon(std::string mnt_pnt, std::string blk_device, bool is
 }  // namespace
 
 Status cp_prepareCheckpoint() {
+    // Log to notify CTS - see b/137924328 for context
+    LOG(INFO) << "cp_prepareCheckpoint called";
     std::lock_guard<std::mutex> lock(isCheckpointingLock);
     if (!isCheckpointing) {
         return Status::ok();
@@ -725,6 +733,11 @@ Status cp_markBootAttempt() {
             return error("Could not write checkpoint file");
     }
     return Status::ok();
+}
+
+void cp_resetCheckpoint() {
+    std::lock_guard<std::mutex> lock(isCheckpointingLock);
+    needsCheckpointWasCalled = false;
 }
 
 }  // namespace vold

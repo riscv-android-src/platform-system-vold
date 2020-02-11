@@ -52,9 +52,9 @@ cc_defaults {
         "libdiskconfig",
         "libext4_utils",
         "libf2fs_sparseblock",
-        "libfscrypt",
         "libhardware",
         "libhardware_legacy",
+        "libincfs",
         "libhidlbase",
         "libkeymaster4support",
         "libkeyutils",
@@ -79,9 +79,15 @@ cc_library_static {
     ],
     aidl: {
         local_include_dirs: ["binder"],
-        include_dirs: ["frameworks/native/aidl/binder"],
+        include_dirs: [
+            "frameworks/native/aidl/binder",
+            "frameworks/base/core/java",
+        ],
         export_aidl_headers: true,
     },
+    whole_static_libs: [
+        "libincremental_aidl-cpp",
+    ],
 }
 
 cc_library_headers {
