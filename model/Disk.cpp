@@ -20,6 +20,7 @@
 #include "PublicVolume.h"
 #include "Utils.h"
 #include "VolumeBase.h"
+#include "VolumeEncryption.h"
 #include "VolumeManager.h"
 
 #include <android-base/file.h>
@@ -29,8 +30,6 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <fscrypt/fscrypt.h>
-
-#include "cryptfs.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
@@ -216,7 +215,8 @@ void Disk::createPrivateVolume(dev_t device, const std::string& partGuid) {
 
     LOG(DEBUG) << "Found key for GUID " << normalizedGuid;
 
-    auto vol = std::shared_ptr<VolumeBase>(new PrivateVolume(device, keyRaw));
+    auto keyBuffer = KeyBuffer(keyRaw.begin(), keyRaw.end());
+    auto vol = std::shared_ptr<VolumeBase>(new PrivateVolume(device, keyBuffer));
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
         vol->setSilent(true);
@@ -504,11 +504,12 @@ status_t Disk::partitionMixed(int8_t ratio) {
         return -EIO;
     }
 
-    std::string keyRaw;
-    if (ReadRandomBytes(cryptfs_get_keysize(), keyRaw) != OK) {
+    KeyBuffer key;
+    if (!generate_volume_key(&key)) {
         LOG(ERROR) << "Failed to generate key";
         return -EIO;
     }
+    std::string keyRaw(key.begin(), key.end());
 
     std::string partGuid;
     StrToHex(partGuidRaw, partGuid);
