@@ -17,17 +17,19 @@
 #define ATRACE_TAG ATRACE_TAG_PACKAGE_MANAGER
 
 #include "VoldNativeService.h"
+
 #include "Benchmark.h"
 #include "CheckEncryption.h"
-#include "IdleMaint.h"
-#include "MoveStorage.h"
-#include "Process.h"
-#include "VolumeManager.h"
-
 #include "Checkpoint.h"
 #include "FsCrypt.h"
+#include "IdleMaint.h"
 #include "MetadataCrypt.h"
+#include "MoveStorage.h"
+#include "Process.h"
+#include "VoldUtil.h"
+#include "VolumeManager.h"
 #include "cryptfs.h"
+
 #include "incfs_ndk.h"
 
 #include <fstream>
@@ -761,6 +763,15 @@ binder::Status VoldNativeService::addUserKeyAuth(int32_t userId, int32_t userSer
     return translateBool(fscrypt_add_user_key_auth(userId, userSerial, token, secret));
 }
 
+binder::Status VoldNativeService::clearUserKeyAuth(int32_t userId, int32_t userSerial,
+                                                   const std::string& token,
+                                                   const std::string& secret) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_CRYPT_LOCK;
+
+    return translateBool(fscrypt_clear_user_key_auth(userId, userSerial, token, secret));
+}
+
 binder::Status VoldNativeService::fixateNewestUserKeyAuth(int32_t userId) {
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_CRYPT_LOCK;
@@ -784,7 +795,7 @@ binder::Status VoldNativeService::lockUserKey(int32_t userId) {
     return translateBool(fscrypt_lock_user_key(userId));
 }
 
-binder::Status VoldNativeService::prepareUserStorage(const std::unique_ptr<std::string>& uuid,
+binder::Status VoldNativeService::prepareUserStorage(const std::optional<std::string>& uuid,
                                                      int32_t userId, int32_t userSerial,
                                                      int32_t flags) {
     ENFORCE_SYSTEM_OR_ROOT;
@@ -796,7 +807,7 @@ binder::Status VoldNativeService::prepareUserStorage(const std::unique_ptr<std::
     return translateBool(fscrypt_prepare_user_storage(uuid_, userId, userSerial, flags));
 }
 
-binder::Status VoldNativeService::destroyUserStorage(const std::unique_ptr<std::string>& uuid,
+binder::Status VoldNativeService::destroyUserStorage(const std::optional<std::string>& uuid,
                                                      int32_t userId, int32_t flags) {
     ENFORCE_SYSTEM_OR_ROOT;
     std::string empty_string = "";
@@ -933,9 +944,9 @@ binder::Status VoldNativeService::mountIncFs(
               << result.logFd;
     using ParcelFileDescriptor = ::android::os::ParcelFileDescriptor;
     using unique_fd = ::android::base::unique_fd;
-    _aidl_return->cmd = std::make_unique<ParcelFileDescriptor>(unique_fd(result.cmdFd));
+    _aidl_return->cmd = ParcelFileDescriptor(unique_fd(result.cmdFd));
     if (result.logFd >= 0) {
-        _aidl_return->log = std::make_unique<ParcelFileDescriptor>(unique_fd(result.logFd));
+        _aidl_return->log = ParcelFileDescriptor(unique_fd(result.logFd));
     }
     return ok();
 }
