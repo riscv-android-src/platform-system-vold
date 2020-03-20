@@ -29,20 +29,38 @@
 #include <android-base/logging.h>
 #include <keyutils.h>
 
+#include <fscrypt_uapi.h>
 #include "KeyStorage.h"
 #include "Utils.h"
 
 namespace android {
 namespace vold {
 
-bool randomKey(KeyBuffer* key) {
-    *key = KeyBuffer(FSCRYPT_MAX_KEY_SIZE);
+const KeyGeneration neverGen() {
+    return KeyGeneration{0, false, false};
+}
+
+static bool randomKey(size_t size, KeyBuffer* key) {
+    *key = KeyBuffer(size);
     if (ReadRandomBytes(key->size(), key->data()) != 0) {
         // TODO status_t plays badly with PLOG, fix it.
         LOG(ERROR) << "Random read failed";
         return false;
     }
     return true;
+}
+
+bool generateStorageKey(const KeyGeneration& gen, KeyBuffer* key) {
+    if (!gen.allow_gen) return false;
+    if (gen.use_hw_wrapped_key) {
+        if (gen.keysize != FSCRYPT_MAX_KEY_SIZE) {
+            LOG(ERROR) << "Cannot generate a wrapped key " << gen.keysize << " bytes long";
+            return false;
+        }
+        return generateWrappedStorageKey(key);
+    } else {
+        return randomKey(gen.keysize, key);
+    }
 }
 
 // Return true if the kernel supports the ioctls to add/remove fscrypt keys
@@ -137,7 +155,7 @@ static bool fscryptKeyring(key_serial_t* device_keyring) {
     return true;
 }
 
-// Add an encryption key to the legacy global session keyring.
+// Add an encryption key of type "logon" to the global session keyring.
 static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
     // Place fscrypt_key into automatically zeroing buffer.
     KeyBuffer fsKeyBuffer(sizeof(fscrypt_key));
@@ -160,82 +178,72 @@ static bool installKeyLegacy(const KeyBuffer& key, const std::string& raw_ref) {
     return true;
 }
 
+// Installs fscrypt-provisioning key into session level kernel keyring.
+// This allows for the given key to be installed back into filesystem keyring.
+// For more context see reloadKeyFromSessionKeyring.
+static bool installProvisioningKey(const KeyBuffer& key, const std::string& ref,
+                                   const fscrypt_key_specifier& key_spec) {
+    key_serial_t device_keyring;
+    if (!fscryptKeyring(&device_keyring)) return false;
+
+    // Place fscrypt_provisioning_key_payload into automatically zeroing buffer.
+    KeyBuffer buf(sizeof(fscrypt_provisioning_key_payload) + key.size(), 0);
+    fscrypt_provisioning_key_payload& provisioning_key =
+            *reinterpret_cast<fscrypt_provisioning_key_payload*>(buf.data());
+    memcpy(provisioning_key.raw, key.data(), key.size());
+    provisioning_key.type = key_spec.type;
+
+    key_serial_t key_id = add_key("fscrypt-provisioning", ref.c_str(), (void*)&provisioning_key,
+                                  buf.size(), device_keyring);
+    if (key_id == -1) {
+        PLOG(ERROR) << "Failed to insert fscrypt-provisioning key for " << ref
+                    << " into session keyring";
+        return false;
+    }
+    LOG(DEBUG) << "Added fscrypt-provisioning key for " << ref << " to session keyring";
+    return true;
+}
+
 // Build a struct fscrypt_key_specifier for use in the key management ioctls.
-static bool buildKeySpecifier(fscrypt_key_specifier* spec, const std::string& raw_ref,
-                              int policy_version) {
-    switch (policy_version) {
+static bool buildKeySpecifier(fscrypt_key_specifier* spec, const EncryptionPolicy& policy) {
+    switch (policy.options.version) {
         case 1:
-            if (raw_ref.size() != FSCRYPT_KEY_DESCRIPTOR_SIZE) {
+            if (policy.key_raw_ref.size() != FSCRYPT_KEY_DESCRIPTOR_SIZE) {
                 LOG(ERROR) << "Invalid key specifier size for v1 encryption policy: "
-                           << raw_ref.size();
+                           << policy.key_raw_ref.size();
                 return false;
             }
             spec->type = FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR;
-            memcpy(spec->u.descriptor, raw_ref.c_str(), FSCRYPT_KEY_DESCRIPTOR_SIZE);
+            memcpy(spec->u.descriptor, policy.key_raw_ref.c_str(), FSCRYPT_KEY_DESCRIPTOR_SIZE);
             return true;
         case 2:
-            if (raw_ref.size() != FSCRYPT_KEY_IDENTIFIER_SIZE) {
+            if (policy.key_raw_ref.size() != FSCRYPT_KEY_IDENTIFIER_SIZE) {
                 LOG(ERROR) << "Invalid key specifier size for v2 encryption policy: "
-                           << raw_ref.size();
+                           << policy.key_raw_ref.size();
                 return false;
             }
             spec->type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
-            memcpy(spec->u.identifier, raw_ref.c_str(), FSCRYPT_KEY_IDENTIFIER_SIZE);
+            memcpy(spec->u.identifier, policy.key_raw_ref.c_str(), FSCRYPT_KEY_IDENTIFIER_SIZE);
             return true;
         default:
-            LOG(ERROR) << "Invalid encryption policy version: " << policy_version;
+            LOG(ERROR) << "Invalid encryption policy version: " << policy.options.version;
             return false;
     }
 }
 
-// Install a file-based encryption key to the kernel, for use by encrypted files
-// on the specified filesystem using the specified encryption policy version.
+// Installs key into keyring of a filesystem mounted on |mountpoint|.
 //
-// For v1 policies, we use FS_IOC_ADD_ENCRYPTION_KEY if the kernel supports it.
-// Otherwise we add the key to the legacy global session keyring.
+// It's callers responsibility to fill key specifier, and either arg->raw or arg->key_id.
 //
-// For v2 policies, we always use FS_IOC_ADD_ENCRYPTION_KEY; it's the only way
-// the kernel supports.
+// In case arg->key_spec.type equals to FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER
+// arg->key_spec.u.identifier will be populated with raw key reference generated
+// by kernel.
 //
-// Returns %true on success, %false on failure.  On success also sets *raw_ref
-// to the raw key reference for use in the encryption policy.
-bool installKey(const KeyBuffer& key, const std::string& mountpoint, int policy_version,
-                std::string* raw_ref) {
-    // Put the fscrypt_add_key_arg in an automatically-zeroing buffer, since we
-    // have to copy the raw key into it.
-    KeyBuffer arg_buf(sizeof(struct fscrypt_add_key_arg) + key.size(), 0);
-    struct fscrypt_add_key_arg* arg = (struct fscrypt_add_key_arg*)arg_buf.data();
-
-    // Initialize the "key specifier", which is like a name for the key.
-    switch (policy_version) {
-        case 1:
-            // A key for a v1 policy is specified by an arbitrary 8-byte
-            // "descriptor", which must be provided by userspace.  We use the
-            // first 8 bytes from the double SHA-512 of the key itself.
-            *raw_ref = generateKeyRef((const uint8_t*)key.data(), key.size());
-            if (!isFsKeyringSupported()) {
-                return installKeyLegacy(key, *raw_ref);
-            }
-            if (!buildKeySpecifier(&arg->key_spec, *raw_ref, policy_version)) {
-                return false;
-            }
-            break;
-        case 2:
-            // A key for a v2 policy is specified by an 16-byte "identifier",
-            // which is a cryptographic hash of the key itself which the kernel
-            // computes and returns.  Any user-provided value is ignored; we
-            // just need to set the specifier type to indicate that we're adding
-            // this type of key.
-            arg->key_spec.type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
-            break;
-        default:
-            LOG(ERROR) << "Invalid encryption policy version: " << policy_version;
-            return false;
-    }
-
-    // Provide the raw key.
-    arg->raw_size = key.size();
-    memcpy(arg->raw, key.data(), key.size());
+// For documentation on difference between arg->raw and arg->key_id see
+// https://www.kernel.org/doc/html/latest/filesystems/fscrypt.html#fs-ioc-add-encryption-key
+static bool installFsKeyringKey(const std::string& mountpoint, const EncryptionOptions& options,
+                                fscrypt_add_key_arg* arg) {
+    if (options.use_hw_wrapped_key) arg->flags |= FSCRYPT_ADD_KEY_FLAG_WRAPPED;
 
     android::base::unique_fd fd(open(mountpoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (fd == -1) {
@@ -248,16 +256,62 @@ bool installKey(const KeyBuffer& key, const std::string& mountpoint, int policy_
         return false;
     }
 
-    if (arg->key_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
-        // Retrieve the key identifier that the kernel computed.
-        *raw_ref = std::string((char*)arg->key_spec.u.identifier, FSCRYPT_KEY_IDENTIFIER_SIZE);
-    }
-    LOG(DEBUG) << "Installed fscrypt key with ref " << keyrefstring(*raw_ref) << " to "
-               << mountpoint;
     return true;
 }
 
-// Remove an encryption key from the legacy global session keyring.
+bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
+                const KeyBuffer& key, EncryptionPolicy* policy) {
+    policy->options = options;
+    // Put the fscrypt_add_key_arg in an automatically-zeroing buffer, since we
+    // have to copy the raw key into it.
+    KeyBuffer arg_buf(sizeof(struct fscrypt_add_key_arg) + key.size(), 0);
+    struct fscrypt_add_key_arg* arg = (struct fscrypt_add_key_arg*)arg_buf.data();
+
+    // Initialize the "key specifier", which is like a name for the key.
+    switch (options.version) {
+        case 1:
+            // A key for a v1 policy is specified by an arbitrary 8-byte
+            // "descriptor", which must be provided by userspace.  We use the
+            // first 8 bytes from the double SHA-512 of the key itself.
+            policy->key_raw_ref = generateKeyRef((const uint8_t*)key.data(), key.size());
+            if (!isFsKeyringSupported()) {
+                return installKeyLegacy(key, policy->key_raw_ref);
+            }
+            if (!buildKeySpecifier(&arg->key_spec, *policy)) {
+                return false;
+            }
+            break;
+        case 2:
+            // A key for a v2 policy is specified by an 16-byte "identifier",
+            // which is a cryptographic hash of the key itself which the kernel
+            // computes and returns.  Any user-provided value is ignored; we
+            // just need to set the specifier type to indicate that we're adding
+            // this type of key.
+            arg->key_spec.type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
+            break;
+        default:
+            LOG(ERROR) << "Invalid encryption policy version: " << options.version;
+            return false;
+    }
+
+    arg->raw_size = key.size();
+    memcpy(arg->raw, key.data(), key.size());
+
+    if (!installFsKeyringKey(mountpoint, options, arg)) return false;
+
+    if (arg->key_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
+        // Retrieve the key identifier that the kernel computed.
+        policy->key_raw_ref =
+                std::string((char*)arg->key_spec.u.identifier, FSCRYPT_KEY_IDENTIFIER_SIZE);
+    }
+    std::string ref = keyrefstring(policy->key_raw_ref);
+    LOG(DEBUG) << "Installed fscrypt key with ref " << ref << " to " << mountpoint;
+
+    if (!installProvisioningKey(key, ref, arg->key_spec)) return false;
+    return true;
+}
+
+// Remove an encryption key of type "logon" from the global session keyring.
 static bool evictKeyLegacy(const std::string& raw_ref) {
     key_serial_t device_keyring;
     if (!fscryptKeyring(&device_keyring)) return false;
@@ -280,15 +334,29 @@ static bool evictKeyLegacy(const std::string& raw_ref) {
     return success;
 }
 
-// Evict a file-based encryption key from the kernel.
-//
-// We use FS_IOC_REMOVE_ENCRYPTION_KEY if the kernel supports it.  Otherwise we
-// remove the key from the legacy global session keyring.
-//
-// In the latter case, the caller is responsible for dropping caches.
-bool evictKey(const std::string& mountpoint, const std::string& raw_ref, int policy_version) {
-    if (policy_version == 1 && !isFsKeyringSupported()) {
-        return evictKeyLegacy(raw_ref);
+static bool evictProvisioningKey(const std::string& ref) {
+    key_serial_t device_keyring;
+    if (!fscryptKeyring(&device_keyring)) {
+        return false;
+    }
+
+    auto key_serial = keyctl_search(device_keyring, "fscrypt-provisioning", ref.c_str(), 0);
+    if (key_serial == -1 && errno != ENOKEY) {
+        PLOG(ERROR) << "Error searching session keyring for fscrypt-provisioning key for " << ref;
+        return false;
+    }
+
+    if (key_serial != -1 && keyctl_unlink(key_serial, device_keyring) != 0) {
+        PLOG(ERROR) << "Failed to unlink fscrypt-provisioning key for " << ref
+                    << " from session keyring";
+        return false;
+    }
+    return true;
+}
+
+bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy) {
+    if (policy.options.version == 1 && !isFsKeyringSupported()) {
+        return evictKeyLegacy(policy.key_raw_ref);
     }
 
     android::base::unique_fd fd(open(mountpoint.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
@@ -300,11 +368,11 @@ bool evictKey(const std::string& mountpoint, const std::string& raw_ref, int pol
     struct fscrypt_remove_key_arg arg;
     memset(&arg, 0, sizeof(arg));
 
-    if (!buildKeySpecifier(&arg.key_spec, raw_ref, policy_version)) {
+    if (!buildKeySpecifier(&arg.key_spec, policy)) {
         return false;
     }
 
-    std::string ref = keyrefstring(raw_ref);
+    std::string ref = keyrefstring(policy.key_raw_ref);
 
     if (ioctl(fd, FS_IOC_REMOVE_ENCRYPTION_KEY, &arg) != 0) {
         PLOG(ERROR) << "Failed to evict fscrypt key with ref " << ref << " from " << mountpoint;
@@ -319,48 +387,52 @@ bool evictKey(const std::string& mountpoint, const std::string& raw_ref, int pol
         LOG(ERROR) << "Files still open after removing key with ref " << ref
                    << ".  These files were not locked!";
     }
+
+    if (!evictProvisioningKey(ref)) return false;
     return true;
 }
 
-bool retrieveAndInstallKey(bool create_if_absent, const KeyAuthentication& key_authentication,
-                           const std::string& key_path, const std::string& tmp_path,
-                           const std::string& volume_uuid, int policy_version,
-                           std::string* key_ref) {
-    KeyBuffer key;
+bool retrieveOrGenerateKey(const std::string& key_path, const std::string& tmp_path,
+                           const KeyAuthentication& key_authentication, const KeyGeneration& gen,
+                           KeyBuffer* key, bool keepOld) {
     if (pathExists(key_path)) {
         LOG(DEBUG) << "Key exists, using: " << key_path;
-        if (!retrieveKey(key_path, key_authentication, &key)) return false;
+        if (!retrieveKey(key_path, key_authentication, key, keepOld)) return false;
     } else {
-        if (!create_if_absent) {
+        if (!gen.allow_gen) {
             LOG(ERROR) << "No key found in " << key_path;
             return false;
         }
         LOG(INFO) << "Creating new key in " << key_path;
-        if (!randomKey(&key)) return false;
-        if (!storeKeyAtomically(key_path, tmp_path, key_authentication, key)) return false;
+        if (!generateStorageKey(gen, key)) return false;
+        if (!storeKeyAtomically(key_path, tmp_path, key_authentication, *key)) return false;
     }
+    return true;
+}
 
-    if (!installKey(key, BuildDataPath(volume_uuid), policy_version, key_ref)) {
-        LOG(ERROR) << "Failed to install key in " << key_path;
+bool reloadKeyFromSessionKeyring(const std::string& mountpoint, const EncryptionPolicy& policy) {
+    key_serial_t device_keyring;
+    if (!fscryptKeyring(&device_keyring)) {
         return false;
     }
-    return true;
-}
 
-bool retrieveKey(bool create_if_absent, const std::string& key_path, const std::string& tmp_path,
-                 KeyBuffer* key, bool keepOld) {
-    if (pathExists(key_path)) {
-        LOG(DEBUG) << "Key exists, using: " << key_path;
-        if (!retrieveKey(key_path, kEmptyAuthentication, key, keepOld)) return false;
-    } else {
-        if (!create_if_absent) {
-            LOG(ERROR) << "No key found in " << key_path;
-            return false;
-        }
-        LOG(INFO) << "Creating new key in " << key_path;
-        if (!randomKey(key)) return false;
-        if (!storeKeyAtomically(key_path, tmp_path, kEmptyAuthentication, *key)) return false;
+    std::string ref = keyrefstring(policy.key_raw_ref);
+    auto key_serial = keyctl_search(device_keyring, "fscrypt-provisioning", ref.c_str(), 0);
+    if (key_serial == -1) {
+        PLOG(ERROR) << "Failed to find fscrypt-provisioning key for " << ref
+                    << " in session keyring";
+        return false;
     }
+
+    LOG(DEBUG) << "Installing fscrypt-provisioning key for " << ref << " back into " << mountpoint
+               << " fs-keyring";
+
+    struct fscrypt_add_key_arg arg;
+    memset(&arg, 0, sizeof(arg));
+    if (!buildKeySpecifier(&arg.key_spec, policy)) return false;
+    arg.key_id = key_serial;
+    if (!installFsKeyringKey(mountpoint, policy.options, &arg)) return false;
+
     return true;
 }
 
