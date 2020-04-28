@@ -30,8 +30,6 @@ cc_defaults {
     static_libs: [
         "libavb",
         "libbootloader_message",
-        "libdm",
-        "libext2_uuid",
         "libfec",
         "libfec_rs",
         "libfs_avb",
@@ -52,9 +50,11 @@ cc_defaults {
         "libdiskconfig",
         "libext4_utils",
         "libf2fs_sparseblock",
+        "libfscrypt",
         "libhardware",
         "libhardware_legacy",
         "libhidlbase",
+        "libhwbinder",
         "libkeymaster4support",
         "libkeyutils",
         "liblog",
@@ -85,7 +85,6 @@ cc_library_static {
 
 cc_library_headers {
     name: "libvold_headers",
-    recovery_available: true,
     export_include_dirs: ["."],
 }
 
@@ -190,6 +189,7 @@ cc_binary {
 
     shared_libs: [
         "android.hardware.health.storage@1.0",
+        "libhidltransport",
     ],
 }
 
@@ -227,6 +227,7 @@ cc_binary {
         "libhardware",
         "libhardware_legacy",
         "libhidlbase",
+        "libhwbinder",
         "libkeymaster4support",
     ],
 }
@@ -266,5 +267,6 @@ filegroup {
         "binder/android/os/IVoldListener.aidl",
         "binder/android/os/IVoldTaskListener.aidl",
     ],
-    path: "binder",
 }
+
+subdirs = ["tests"]

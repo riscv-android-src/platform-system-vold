@@ -140,7 +140,6 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status supportsCheckpoint(bool* _aidl_return);
     binder::Status supportsBlockCheckpoint(bool* _aidl_return);
     binder::Status supportsFileCheckpoint(bool* _aidl_return);
-    binder::Status resetCheckpoint();
 };
 
 }  // namespace vold

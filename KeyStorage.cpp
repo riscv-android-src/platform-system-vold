@@ -16,10 +16,10 @@
 
 #include "KeyStorage.h"
 
-#include "Checkpoint.h"
 #include "Keymaster.h"
 #include "ScryptParameters.h"
 #include "Utils.h"
+#include "Checkpoint.h"
 
 #include <thread>
 #include <vector>
@@ -37,8 +37,8 @@
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
-#include <android-base/properties.h>
 #include <android-base/unique_fd.h>
+#include <android-base/properties.h>
 
 #include <cutils/properties.h>
 
@@ -126,13 +126,7 @@ static bool generateKeymasterKey(Keymaster& keymaster, const KeyAuthentication& 
         paramBuilder.Authorization(km::TAG_USER_AUTH_TYPE, km::HardwareAuthenticatorType::PASSWORD);
         paramBuilder.Authorization(km::TAG_AUTH_TIMEOUT, AUTH_TIMEOUT);
     }
-
-    auto paramsWithRollback = paramBuilder;
-    paramsWithRollback.Authorization(km::TAG_ROLLBACK_RESISTANCE);
-
-    // Generate rollback-resistant key if possible.
-    return keymaster.generateKey(paramsWithRollback, key) ||
-           keymaster.generateKey(paramBuilder, key);
+    return keymaster.generateKey(paramBuilder, key);
 }
 
 static std::pair<km::AuthorizationSet, km::HardwareAuthToken> beginParams(

@@ -32,7 +32,6 @@
 
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
-#include <android-base/strings.h>
 #include <android-base/stringprintf.h>
 #include <binder/IServiceManager.h>
 #include <binder/Status.h>
@@ -56,10 +55,9 @@ static android::sp<android::IBinder> getServiceAggressive() {
     return res;
 }
 
-static void checkStatus(std::vector<std::string>& cmd, android::binder::Status status) {
+static void checkStatus(android::binder::Status status) {
     if (status.isOk()) return;
-    std::string command = ::android::base::Join(cmd, " ");
-    LOG(ERROR) << "Command: " << command << " Failed: " << status.toString8().string();
+    LOG(ERROR) << "Failed: " << status.toString8().string();
     exit(ENOTTY);
 }
 
@@ -90,65 +88,63 @@ int main(int argc, char** argv) {
     auto vold = android::interface_cast<android::os::IVold>(binder);
 
     if (args[0] == "cryptfs" && args[1] == "enablefilecrypto") {
-        checkStatus(args, vold->fbeEnable());
+        checkStatus(vold->fbeEnable());
     } else if (args[0] == "cryptfs" && args[1] == "init_user0") {
-        checkStatus(args, vold->initUser0());
+        checkStatus(vold->initUser0());
     } else if (args[0] == "cryptfs" && args[1] == "enablecrypto") {
         int passwordType = android::os::IVold::PASSWORD_TYPE_DEFAULT;
         int encryptionFlags = android::os::IVold::ENCRYPTION_FLAG_NO_UI;
-        checkStatus(args, vold->fdeEnable(passwordType, "", encryptionFlags));
+        checkStatus(vold->fdeEnable(passwordType, "", encryptionFlags));
     } else if (args[0] == "cryptfs" && args[1] == "mountdefaultencrypted") {
-        checkStatus(args, vold->mountDefaultEncrypted());
+        checkStatus(vold->mountDefaultEncrypted());
     } else if (args[0] == "volume" && args[1] == "shutdown") {
-        checkStatus(args, vold->shutdown());
+        checkStatus(vold->shutdown());
     } else if (args[0] == "cryptfs" && args[1] == "checkEncryption" && args.size() == 3) {
-        checkStatus(args, vold->checkEncryption(args[2]));
+        checkStatus(vold->checkEncryption(args[2]));
     } else if (args[0] == "cryptfs" && args[1] == "mountFstab" && args.size() == 4) {
-        checkStatus(args, vold->mountFstab(args[2], args[3]));
+        checkStatus(vold->mountFstab(args[2], args[3]));
     } else if (args[0] == "cryptfs" && args[1] == "encryptFstab" && args.size() == 4) {
-        checkStatus(args, vold->encryptFstab(args[2], args[3]));
+        checkStatus(vold->encryptFstab(args[2], args[3]));
     } else if (args[0] == "checkpoint" && args[1] == "supportsCheckpoint" && args.size() == 2) {
         bool supported = false;
-        checkStatus(args, vold->supportsCheckpoint(&supported));
+        checkStatus(vold->supportsCheckpoint(&supported));
         return supported ? 1 : 0;
     } else if (args[0] == "checkpoint" && args[1] == "supportsBlockCheckpoint" && args.size() == 2) {
         bool supported = false;
-        checkStatus(args, vold->supportsBlockCheckpoint(&supported));
+        checkStatus(vold->supportsBlockCheckpoint(&supported));
         return supported ? 1 : 0;
     } else if (args[0] == "checkpoint" && args[1] == "supportsFileCheckpoint" && args.size() == 2) {
         bool supported = false;
-        checkStatus(args, vold->supportsFileCheckpoint(&supported));
+        checkStatus(vold->supportsFileCheckpoint(&supported));
         return supported ? 1 : 0;
     } else if (args[0] == "checkpoint" && args[1] == "startCheckpoint" && args.size() == 3) {
         int retry;
         if (!android::base::ParseInt(args[2], &retry)) exit(EINVAL);
-        checkStatus(args, vold->startCheckpoint(retry));
+        checkStatus(vold->startCheckpoint(retry));
     } else if (args[0] == "checkpoint" && args[1] == "needsCheckpoint" && args.size() == 2) {
         bool enabled = false;
-        checkStatus(args, vold->needsCheckpoint(&enabled));
+        checkStatus(vold->needsCheckpoint(&enabled));
         return enabled ? 1 : 0;
     } else if (args[0] == "checkpoint" && args[1] == "needsRollback" && args.size() == 2) {
         bool enabled = false;
-        checkStatus(args, vold->needsRollback(&enabled));
+        checkStatus(vold->needsRollback(&enabled));
         return enabled ? 1 : 0;
     } else if (args[0] == "checkpoint" && args[1] == "commitChanges" && args.size() == 2) {
-        checkStatus(args, vold->commitChanges());
+        checkStatus(vold->commitChanges());
     } else if (args[0] == "checkpoint" && args[1] == "prepareCheckpoint" && args.size() == 2) {
-        checkStatus(args, vold->prepareCheckpoint());
+        checkStatus(vold->prepareCheckpoint());
     } else if (args[0] == "checkpoint" && args[1] == "restoreCheckpoint" && args.size() == 3) {
-        checkStatus(args, vold->restoreCheckpoint(args[2]));
+        checkStatus(vold->restoreCheckpoint(args[2]));
     } else if (args[0] == "checkpoint" && args[1] == "restoreCheckpointPart" && args.size() == 4) {
         int count;
         if (!android::base::ParseInt(args[3], &count)) exit(EINVAL);
-        checkStatus(args, vold->restoreCheckpointPart(args[2], count));
+        checkStatus(vold->restoreCheckpointPart(args[2], count));
     } else if (args[0] == "checkpoint" && args[1] == "markBootAttempt" && args.size() == 2) {
-        checkStatus(args, vold->markBootAttempt());
+        checkStatus(vold->markBootAttempt());
     } else if (args[0] == "checkpoint" && args[1] == "abortChanges" && args.size() == 4) {
         int retry;
         if (!android::base::ParseInt(args[2], &retry)) exit(EINVAL);
-        checkStatus(args, vold->abortChanges(args[2], retry != 0));
-    } else if (args[0] == "checkpoint" && args[1] == "resetCheckpoint") {
-        checkStatus(args, vold->resetCheckpoint());
+        checkStatus(vold->abortChanges(args[2], retry != 0));
     } else {
         LOG(ERROR) << "Raw commands are no longer supported";
         exit(EINVAL);

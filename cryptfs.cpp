@@ -44,24 +44,25 @@
 #include <f2fs_sparseblock.h>
 #include <fs_mgr.h>
 #include <fscrypt/fscrypt.h>
-#include <libdm/dm.h>
+#include <hardware_legacy/power.h>
 #include <log/log.h>
 #include <logwrap/logwrap.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <selinux/selinux.h>
-#include <wakelock/wakelock.h>
 
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <libgen.h>
+#include <linux/dm-ioctl.h>
 #include <linux/kdev_t.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/stat.h>
@@ -77,10 +78,11 @@ extern "C" {
 using android::base::ParseUint;
 using android::base::StringPrintf;
 using android::fs_mgr::GetEntryForMountPoint;
-using namespace android::dm;
 using namespace std::chrono_literals;
 
 #define UNUSED __attribute__((unused))
+
+#define DM_CRYPT_BUF_SIZE 4096
 
 #define HASH_COUNT 2000
 
@@ -249,6 +251,19 @@ static void cryptfs_reboot(RebootType rt) {
 
     /* Shouldn't get here, reboot should happen before sleep times out */
     return;
+}
+
+static void ioctl_init(struct dm_ioctl* io, size_t dataSize, const char* name, unsigned flags) {
+    memset(io, 0, dataSize);
+    io->data_size = dataSize;
+    io->data_start = sizeof(struct dm_ioctl);
+    io->version[0] = 4;
+    io->version[1] = 0;
+    io->version[2] = 0;
+    io->flags = flags;
+    if (name) {
+        strlcpy(io->name, name, sizeof(io->name));
+    }
 }
 
 namespace {
@@ -958,12 +973,109 @@ static void convert_key_to_hex_ascii(const unsigned char* master_key, unsigned i
     master_key_ascii[a] = '\0';
 }
 
+static int load_crypto_mapping_table(struct crypt_mnt_ftr* crypt_ftr,
+                                     const unsigned char* master_key, const char* real_blk_name,
+                                     const char* name, int fd, const char* extra_params) {
+    alignas(struct dm_ioctl) char buffer[DM_CRYPT_BUF_SIZE];
+    struct dm_ioctl* io;
+    struct dm_target_spec* tgt;
+    char* crypt_params;
+    // We need two ASCII characters to represent each byte, and need space for
+    // the '\0' terminator.
+    char master_key_ascii[MAX_KEY_LEN * 2 + 1];
+    size_t buff_offset;
+    int i;
+
+    io = (struct dm_ioctl*)buffer;
+
+    /* Load the mapping table for this device */
+    tgt = (struct dm_target_spec*)&buffer[sizeof(struct dm_ioctl)];
+
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+    io->target_count = 1;
+    tgt->status = 0;
+    tgt->sector_start = 0;
+    tgt->length = crypt_ftr->fs_size;
+    strlcpy(tgt->target_type, "crypt", DM_MAX_TYPE_NAME);
+
+    crypt_params = buffer + sizeof(struct dm_ioctl) + sizeof(struct dm_target_spec);
+    convert_key_to_hex_ascii(master_key, crypt_ftr->keysize, master_key_ascii);
+
+    buff_offset = crypt_params - buffer;
+    SLOGI(
+        "Creating crypto dev \"%s\"; cipher=%s, keysize=%u, real_dev=%s, len=%llu, params=\"%s\"\n",
+        name, crypt_ftr->crypto_type_name, crypt_ftr->keysize, real_blk_name, tgt->length * 512,
+        extra_params);
+    snprintf(crypt_params, sizeof(buffer) - buff_offset, "%s %s 0 %s 0 %s",
+             crypt_ftr->crypto_type_name, master_key_ascii, real_blk_name, extra_params);
+    crypt_params += strlen(crypt_params) + 1;
+    crypt_params =
+        (char*)(((unsigned long)crypt_params + 7) & ~8); /* Align to an 8 byte boundary */
+    tgt->next = crypt_params - buffer;
+
+    for (i = 0; i < TABLE_LOAD_RETRIES; i++) {
+        if (!ioctl(fd, DM_TABLE_LOAD, io)) {
+            break;
+        }
+        usleep(500000);
+    }
+
+    if (i == TABLE_LOAD_RETRIES) {
+        /* We failed to load the table, return an error */
+        return -1;
+    } else {
+        return i + 1;
+    }
+}
+
+static int get_dm_crypt_version(int fd, const char* name, int* version) {
+    char buffer[DM_CRYPT_BUF_SIZE];
+    struct dm_ioctl* io;
+    struct dm_target_versions* v;
+
+    io = (struct dm_ioctl*)buffer;
+
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+
+    if (ioctl(fd, DM_LIST_VERSIONS, io)) {
+        return -1;
+    }
+
+    /* Iterate over the returned versions, looking for name of "crypt".
+     * When found, get and return the version.
+     */
+    v = (struct dm_target_versions*)&buffer[sizeof(struct dm_ioctl)];
+    while (v->next) {
+        if (!strcmp(v->name, "crypt")) {
+            /* We found the crypt driver, return the version, and get out */
+            version[0] = v->version[0];
+            version[1] = v->version[1];
+            version[2] = v->version[2];
+            return 0;
+        }
+        v = (struct dm_target_versions*)(((char*)v) + v->next);
+    }
+
+    return -1;
+}
+
+static std::string extra_params_as_string(const std::vector<std::string>& extra_params_vec) {
+    if (extra_params_vec.empty()) return "";
+    std::string extra_params = std::to_string(extra_params_vec.size());
+    for (const auto& p : extra_params_vec) {
+        extra_params.append(" ");
+        extra_params.append(p);
+    }
+    return extra_params;
+}
+
 /*
  * If the ro.crypto.fde_sector_size system property is set, append the
  * parameters to make dm-crypt use the specified crypto sector size and round
  * the crypto device size down to a crypto sector boundary.
  */
-static int add_sector_size_param(DmTargetCrypt* target, struct crypt_mnt_ftr* ftr) {
+static int add_sector_size_param(std::vector<std::string>* extra_params_vec,
+                                 struct crypt_mnt_ftr* ftr) {
     constexpr char DM_CRYPT_SECTOR_SIZE[] = "ro.crypto.fde_sector_size";
     char value[PROPERTY_VALUE_MAX];
 
@@ -977,11 +1089,12 @@ static int add_sector_size_param(DmTargetCrypt* target, struct crypt_mnt_ftr* ft
             return -1;
         }
 
-        target->SetSectorSize(sector_size);
+        std::string param = StringPrintf("sector_size:%u", sector_size);
+        extra_params_vec->push_back(std::move(param));
 
         // With this option, IVs will match the sector numbering, instead
         // of being hard-coded to being based on 512-byte sectors.
-        target->SetIvLargeSectors();
+        extra_params_vec->emplace_back("iv_large_sectors");
 
         // Round the crypto device size down to a crypto sector boundary.
         ftr->fs_size &= ~((sector_size / 512) - 1);
@@ -992,67 +1105,112 @@ static int add_sector_size_param(DmTargetCrypt* target, struct crypt_mnt_ftr* ft
 static int create_crypto_blk_dev(struct crypt_mnt_ftr* crypt_ftr, const unsigned char* master_key,
                                  const char* real_blk_name, char* crypto_blk_name, const char* name,
                                  uint32_t flags) {
-    auto& dm = DeviceMapper::Instance();
+    char buffer[DM_CRYPT_BUF_SIZE];
+    struct dm_ioctl* io;
+    unsigned int minor;
+    int fd = 0;
+    int err;
+    int retval = -1;
+    int version[3];
+    int load_count;
+    std::vector<std::string> extra_params_vec;
 
-    // We need two ASCII characters to represent each byte, and need space for
-    // the '\0' terminator.
-    char master_key_ascii[MAX_KEY_LEN * 2 + 1];
-    convert_key_to_hex_ascii(master_key, crypt_ftr->keysize, master_key_ascii);
-
-    auto target = std::make_unique<DmTargetCrypt>(0, crypt_ftr->fs_size,
-                                                  (const char*)crypt_ftr->crypto_type_name,
-                                                  master_key_ascii, 0, real_blk_name, 0);
-    target->AllowDiscards();
-
-    if (flags & CREATE_CRYPTO_BLK_DEV_FLAGS_ALLOW_ENCRYPT_OVERRIDE) {
-        target->AllowEncryptOverride();
-    }
-    if (add_sector_size_param(target.get(), crypt_ftr)) {
-        SLOGE("Error processing dm-crypt sector size param\n");
-        return -1;
+    if ((fd = open("/dev/device-mapper", O_RDWR | O_CLOEXEC)) < 0) {
+        SLOGE("Cannot open device-mapper\n");
+        goto errout;
     }
 
-    DmTable table;
-    table.AddTarget(std::move(target));
+    io = (struct dm_ioctl*)buffer;
 
-    int load_count = 1;
-    while (load_count < TABLE_LOAD_RETRIES) {
-        if (dm.CreateDevice(name, table)) {
-            break;
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+    err = ioctl(fd, DM_DEV_CREATE, io);
+    if (err) {
+        SLOGE("Cannot create dm-crypt device %s: %s\n", name, strerror(errno));
+        goto errout;
+    }
+
+    /* Get the device status, in particular, the name of it's device file */
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+    if (ioctl(fd, DM_DEV_STATUS, io)) {
+        SLOGE("Cannot retrieve dm-crypt device status\n");
+        goto errout;
+    }
+    minor = (io->dev & 0xff) | ((io->dev >> 12) & 0xfff00);
+    snprintf(crypto_blk_name, MAXPATHLEN, "/dev/block/dm-%u", minor);
+
+    if (!get_dm_crypt_version(fd, name, version)) {
+        /* Support for allow_discards was added in version 1.11.0 */
+        if ((version[0] >= 2) || ((version[0] == 1) && (version[1] >= 11))) {
+            extra_params_vec.emplace_back("allow_discards");
         }
-        load_count++;
     }
-
-    if (load_count >= TABLE_LOAD_RETRIES) {
+    if (flags & CREATE_CRYPTO_BLK_DEV_FLAGS_ALLOW_ENCRYPT_OVERRIDE) {
+        extra_params_vec.emplace_back("allow_encrypt_override");
+    }
+    if (add_sector_size_param(&extra_params_vec, crypt_ftr)) {
+        SLOGE("Error processing dm-crypt sector size param\n");
+        goto errout;
+    }
+    load_count = load_crypto_mapping_table(crypt_ftr, master_key, real_blk_name, name, fd,
+                                           extra_params_as_string(extra_params_vec).c_str());
+    if (load_count < 0) {
         SLOGE("Cannot load dm-crypt mapping table.\n");
-        return -1;
-    }
-    if (load_count > 1) {
+        goto errout;
+    } else if (load_count > 1) {
         SLOGI("Took %d tries to load dmcrypt table.\n", load_count);
     }
 
-    std::string path;
-    if (!dm.GetDmDevicePathByName(name, &path)) {
-        SLOGE("Cannot determine dm-crypt path for %s.\n", name);
-        return -1;
+    /* Resume this device to activate it */
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+
+    if (ioctl(fd, DM_DEV_SUSPEND, io)) {
+        SLOGE("Cannot resume the dm-crypt device\n");
+        goto errout;
     }
-    snprintf(crypto_blk_name, MAXPATHLEN, "%s", path.c_str());
 
     /* Ensure the dm device has been created before returning. */
     if (android::vold::WaitForFile(crypto_blk_name, 1s) < 0) {
         // WaitForFile generates a suitable log message
-        return -1;
+        goto errout;
     }
-    return 0;
+
+    /* We made it here with no errors.  Woot! */
+    retval = 0;
+
+errout:
+    close(fd); /* If fd is <0 from a failed open call, it's safe to just ignore the close error */
+
+    return retval;
 }
 
-static int delete_crypto_blk_dev(const std::string& name) {
-    auto& dm = DeviceMapper::Instance();
-    if (!dm.DeleteDevice(name)) {
-        SLOGE("Cannot remove dm-crypt device %s: %s\n", name.c_str(), strerror(errno));
-        return -1;
+static int delete_crypto_blk_dev(const char* name) {
+    int fd;
+    char buffer[DM_CRYPT_BUF_SIZE];
+    struct dm_ioctl* io;
+    int retval = -1;
+    int err;
+
+    if ((fd = open("/dev/device-mapper", O_RDWR | O_CLOEXEC)) < 0) {
+        SLOGE("Cannot open device-mapper\n");
+        goto errout;
     }
-    return 0;
+
+    io = (struct dm_ioctl*)buffer;
+
+    ioctl_init(io, DM_CRYPT_BUF_SIZE, name, 0);
+    err = ioctl(fd, DM_DEV_REMOVE, io);
+    if (err) {
+        SLOGE("Cannot remove dm-crypt device %s: %s\n", name, strerror(errno));
+        goto errout;
+    }
+
+    /* We made it here with no errors.  Woot! */
+    retval = 0;
+
+errout:
+    close(fd); /* If fd is <0 from a failed open call, it's safe to just ignore the close error */
+
+    return retval;
 }
 
 static int pbkdf2(const char* passwd, const unsigned char* salt, unsigned char* ikey,
@@ -1766,7 +1924,7 @@ int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev, const u
  * storage volume.
  */
 int cryptfs_revert_ext_volume(const char* label) {
-    return delete_crypto_blk_dev(label);
+    return delete_crypto_blk_dev((char*)label);
 }
 
 int cryptfs_crypto_complete(void) {
@@ -2007,7 +2165,6 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
     off64_t previously_encrypted_upto = 0;
     bool rebootEncryption = false;
     bool onlyCreateHeader = false;
-    std::unique_ptr<android::wakelock::WakeLock> wakeLock = nullptr;
 
     if (get_crypt_ftr_and_key(&crypt_ftr) == 0) {
         if (crypt_ftr.flags & CRYPT_ENCRYPTION_IN_PROGRESS) {
@@ -2074,7 +2231,7 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
      * wants to keep the screen on, it can grab a full wakelock.
      */
     snprintf(lockid, sizeof(lockid), "enablecrypto%d", (int)getpid());
-    wakeLock = std::make_unique<android::wakelock::WakeLock>(lockid);
+    acquire_wake_lock(PARTIAL_WAKE_LOCK, lockid);
 
     /* The init files are setup to stop the class main and late start when
      * vold sets trigger_shutdown_framework.
@@ -2107,7 +2264,6 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
          * /data, set a property saying we're doing inplace encryption,
          * and restart the framework.
          */
-        wait_and_unmount(DATA_MNT_POINT, true);
         if (fs_mgr_do_tmpfs_mount(DATA_MNT_POINT)) {
             goto error_shutting_down;
         }
@@ -2255,7 +2411,7 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
                 /* default encryption - continue first boot sequence */
                 property_set("ro.crypto.state", "encrypted");
                 property_set("ro.crypto.type", "block");
-                wakeLock.reset(nullptr);
+                release_wake_lock(lockid);
                 if (rebootEncryption && crypt_ftr.crypt_type != CRYPT_TYPE_DEFAULT) {
                     // Bring up cryptkeeper that will check the password and set it
                     property_set("vold.decrypt", "trigger_shutdown_framework");
@@ -2292,6 +2448,7 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
         } else {
             /* set property to trigger dialog */
             property_set("vold.encrypt_progress", "error_partially_encrypted");
+            release_wake_lock(lockid);
         }
         return -1;
     }
@@ -2301,10 +2458,14 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
      * Set the property and return.  Hope the framework can deal with it.
      */
     property_set("vold.encrypt_progress", "error_reboot_failed");
+    release_wake_lock(lockid);
     return rc;
 
 error_unencrypted:
     property_set("vold.encrypt_progress", "error_not_encrypted");
+    if (lockid[0]) {
+        release_wake_lock(lockid);
+    }
     return -1;
 
 error_shutting_down:
@@ -2319,6 +2480,9 @@ error_shutting_down:
 
     /* shouldn't get here */
     property_set("vold.encrypt_progress", "error_shutting_down");
+    if (lockid[0]) {
+        release_wake_lock(lockid);
+    }
     return -1;
 }
 

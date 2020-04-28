@@ -45,7 +45,6 @@ android::binder::Status cp_restoreCheckpoint(const std::string& mountPoint, int 
 
 android::binder::Status cp_markBootAttempt();
 
-void cp_resetCheckpoint();
 }  // namespace vold
 }  // namespace android
 
