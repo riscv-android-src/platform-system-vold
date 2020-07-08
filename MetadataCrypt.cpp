@@ -99,7 +99,7 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
     }
     auto mount_rc = fs_mgr_do_mount(&fstab_default, const_cast<char*>(mount_point),
                                     const_cast<char*>(blk_device), nullptr,
-                                    android::vold::cp_needsCheckpoint());
+                                    android::vold::cp_needsCheckpoint(), true);
     if (setexeccon(nullptr)) {
         PLOG(ERROR) << "Failed to clear setexeccon";
         return false;
@@ -337,6 +337,11 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
 
     LOG(DEBUG) << "Mounting metadata-encrypted filesystem:" << mount_point;
     mount_via_fs_mgr(mount_point.c_str(), crypto_blkdev.c_str());
+
+    // Record that there's at least one fstab entry with metadata encryption
+    if (!android::base::SetProperty("ro.crypto.metadata.enabled", "true")) {
+        LOG(WARNING) << "failed to set ro.crypto.metadata.enabled";  // This isn't fatal
+    }
     return true;
 }
 
