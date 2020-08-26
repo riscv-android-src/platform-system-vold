@@ -19,7 +19,6 @@
 #include "VoldNativeService.h"
 
 #include "Benchmark.h"
-#include "CheckEncryption.h"
 #include "Checkpoint.h"
 #include "FsCrypt.h"
 #include "IdleMaint.h"
@@ -338,17 +337,6 @@ binder::Status VoldNativeService::benchmark(
 
     std::thread([=]() { android::vold::Benchmark(path, listener); }).detach();
     return Ok();
-}
-
-binder::Status VoldNativeService::checkEncryption(const std::string& volId) {
-    ENFORCE_SYSTEM_OR_ROOT;
-    CHECK_ARGUMENT_ID(volId);
-    ACQUIRE_LOCK;
-
-    std::string path;
-    auto status = pathForVolId(volId, &path);
-    if (!status.isOk()) return status;
-    return translate(android::vold::CheckEncryption(path));
 }
 
 binder::Status VoldNativeService::moveStorage(
@@ -775,6 +763,14 @@ binder::Status VoldNativeService::needsCheckpoint(bool* _aidl_return) {
     ACQUIRE_LOCK;
 
     *_aidl_return = cp_needsCheckpoint();
+    return Ok();
+}
+
+binder::Status VoldNativeService::isCheckpointing(bool* _aidl_return) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    *_aidl_return = cp_isCheckpointing();
     return Ok();
 }
 
