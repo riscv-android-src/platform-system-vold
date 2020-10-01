@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <private/android_filesystem_config.h>
+#include <private/android_projectid_config.h>
 
 #include "android/os/IVold.h"
 
@@ -66,11 +67,14 @@ using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::fs_mgr::GetEntryForMountPoint;
 using android::vold::BuildDataPath;
+using android::vold::IsFilesystemSupported;
 using android::vold::kEmptyAuthentication;
 using android::vold::KeyBuffer;
 using android::vold::KeyGeneration;
 using android::vold::retrieveKey;
 using android::vold::retrieveOrGenerateKey;
+using android::vold::SetQuotaInherit;
+using android::vold::SetQuotaProjectId;
 using android::vold::writeStringToFile;
 using namespace android::fscrypt;
 using namespace android::dm;
@@ -265,10 +269,9 @@ static bool get_volume_file_encryption_options(EncryptionOptions* options) {
     // HEH as default was always a mistake. Use the libfscrypt default (CTS)
     // for devices launching on versions above Android 10.
     auto first_api_level = GetFirstApiLevel();
-    constexpr uint64_t pre_gki_level = 29;
     auto filenames_mode =
             android::base::GetProperty("ro.crypto.volume.filenames_mode",
-                                       first_api_level > pre_gki_level ? "" : "aes-256-heh");
+                                       first_api_level > __ANDROID_API_Q__ ? "" : "aes-256-heh");
     auto options_string = android::base::GetProperty("ro.crypto.volume.options",
                                                      contents_mode + ":" + filenames_mode);
     if (!ParseOptionsForApiLevel(first_api_level, options_string, options)) {
@@ -857,6 +860,7 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
             if (!prepare_dir(vendor_ce_path, 0771, AID_ROOT, AID_ROOT)) return false;
         }
         if (!prepare_dir(media_ce_path, 0770, AID_MEDIA_RW, AID_MEDIA_RW)) return false;
+
         if (!prepare_dir(user_ce_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
         if (fscrypt_is_native()) {
