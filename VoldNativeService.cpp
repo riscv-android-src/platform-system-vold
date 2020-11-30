@@ -33,6 +33,7 @@
 #include "Checkpoint.h"
 #include "FsCrypt.h"
 #include "IdleMaint.h"
+#include "Keymaster.h"
 #include "MetadataCrypt.h"
 #include "MoveStorage.h"
 #include "Process.h"
@@ -879,6 +880,14 @@ binder::Status VoldNativeService::resetCheckpoint() {
     return Ok();
 }
 
+binder::Status VoldNativeService::earlyBootEnded() {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    Keymaster::earlyBootEnded();
+    return Ok();
+}
+
 binder::Status VoldNativeService::incFsEnabled(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_ROOT;
 
@@ -948,6 +957,13 @@ binder::Status VoldNativeService::bindMount(const std::string& sourceDir,
     CHECK_ARGUMENT_PATH(targetDir);
 
     return translate(incfs::bindMount(sourceDir, targetDir));
+}
+
+binder::Status VoldNativeService::destroyDsuMetadataKey(const std::string& dsuSlot) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    return translateBool(destroy_dsu_metadata_key(dsuSlot));
 }
 
 }  // namespace vold
