@@ -150,6 +150,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status supportsFileCheckpoint(bool* _aidl_return);
     binder::Status resetCheckpoint();
 
+    binder::Status earlyBootEnded();
+
     binder::Status incFsEnabled(bool* _aidl_return) override;
     binder::Status mountIncFs(
             const std::string& backingPath, const std::string& targetDir, int32_t flags,
@@ -159,6 +161,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
             const ::android::os::incremental::IncrementalFileSystemControlParcel& control,
             bool enableReadLogs) override;
     binder::Status bindMount(const std::string& sourceDir, const std::string& targetDir) override;
+
+    binder::Status destroyDsuMetadataKey(const std::string& dsuSlot) override;
 };
 
 }  // namespace vold

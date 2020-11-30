@@ -126,6 +126,7 @@ interface IVold {
     boolean supportsFileCheckpoint();
     void resetCheckpoint();
 
+    void earlyBootEnded();
     @utf8InCpp String createStubVolume(@utf8InCpp String sourcePath,
             @utf8InCpp String mountPath, @utf8InCpp String fsType,
             @utf8InCpp String fsUuid, @utf8InCpp String fsLabel, int flags);
@@ -138,6 +139,8 @@ interface IVold {
     void unmountIncFs(@utf8InCpp String dir);
     void setIncFsMountOptions(in IncrementalFileSystemControlParcel control, boolean enableReadLogs);
     void bindMount(@utf8InCpp String sourceDir, @utf8InCpp String targetDir);
+
+    void destroyDsuMetadataKey(@utf8InCpp String dsuSlot);
 
     const int ENCRYPTION_FLAG_NO_UI = 4;
 
@@ -164,6 +167,7 @@ interface IVold {
 
     const int STORAGE_FLAG_DE = 1;
     const int STORAGE_FLAG_CE = 2;
+    const int STORAGE_FLAG_LEVEL_FROM_USER = 4;
 
     const int REMOUNT_MODE_NONE = 0;
     const int REMOUNT_MODE_DEFAULT = 1;
