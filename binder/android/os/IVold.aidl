@@ -54,9 +54,11 @@ interface IVold {
 
     void remountUid(int uid, int remountMode);
     void remountAppStorageDirs(int uid, int pid, in @utf8InCpp String[] packageNames);
+    void unmountAppStorageDirs(int uid, int pid, in @utf8InCpp String[] packageNames);
 
     void setupAppDir(@utf8InCpp String path, int appUid);
     void fixupAppDir(@utf8InCpp String path, int appUid);
+    void ensureAppDirsCreated(in @utf8InCpp String[] paths, int appUid);
 
     @utf8InCpp String createObb(@utf8InCpp String sourcePath, @utf8InCpp String sourceKey,
                                 int ownerGid);
@@ -87,7 +89,9 @@ interface IVold {
     void initUser0();
     boolean isConvertibleToFbe();
     void mountFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint);
-    void encryptFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint);
+    void encryptFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint, boolean shouldFormat, @utf8InCpp String fsType);
+
+    void setStorageBindingSeed(in byte[] seed);
 
     void createUserKey(int userId, int userSerial, boolean ephemeral);
     void destroyUserKey(int userId);
@@ -126,6 +130,7 @@ interface IVold {
     boolean supportsFileCheckpoint();
     void resetCheckpoint();
 
+    void earlyBootEnded();
     @utf8InCpp String createStubVolume(@utf8InCpp String sourcePath,
             @utf8InCpp String mountPath, @utf8InCpp String fsType,
             @utf8InCpp String fsUuid, @utf8InCpp String fsLabel, int flags);
@@ -138,6 +143,8 @@ interface IVold {
     void unmountIncFs(@utf8InCpp String dir);
     void setIncFsMountOptions(in IncrementalFileSystemControlParcel control, boolean enableReadLogs);
     void bindMount(@utf8InCpp String sourceDir, @utf8InCpp String targetDir);
+
+    void destroyDsuMetadataKey(@utf8InCpp String dsuSlot);
 
     const int ENCRYPTION_FLAG_NO_UI = 4;
 

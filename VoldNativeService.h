@@ -66,7 +66,10 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status remountUid(int32_t uid, int32_t remountMode);
     binder::Status remountAppStorageDirs(int uid, int pid,
                                const std::vector<std::string>& packageNames);
+    binder::Status unmountAppStorageDirs(int uid, int pid,
+                               const std::vector<std::string>& packageNames);
 
+    binder::Status ensureAppDirsCreated(const std::vector<std::string>& paths, int32_t appUid);
     binder::Status setupAppDir(const std::string& path, int32_t appUid);
     binder::Status fixupAppDir(const std::string& path, int32_t appUid);
 
@@ -110,7 +113,10 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status initUser0();
     binder::Status isConvertibleToFbe(bool* _aidl_return);
     binder::Status mountFstab(const std::string& blkDevice, const std::string& mountPoint);
-    binder::Status encryptFstab(const std::string& blkDevice, const std::string& mountPoint);
+    binder::Status encryptFstab(const std::string& blkDevice, const std::string& mountPoint,
+                                bool shouldFormat, const std::string& fsType);
+
+    binder::Status setStorageBindingSeed(const std::vector<uint8_t>& seed);
 
     binder::Status createUserKey(int32_t userId, int32_t userSerial, bool ephemeral);
     binder::Status destroyUserKey(int32_t userId);
@@ -150,6 +156,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
     binder::Status supportsFileCheckpoint(bool* _aidl_return);
     binder::Status resetCheckpoint();
 
+    binder::Status earlyBootEnded();
+
     binder::Status incFsEnabled(bool* _aidl_return) override;
     binder::Status mountIncFs(
             const std::string& backingPath, const std::string& targetDir, int32_t flags,
@@ -159,6 +167,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
             const ::android::os::incremental::IncrementalFileSystemControlParcel& control,
             bool enableReadLogs) override;
     binder::Status bindMount(const std::string& sourceDir, const std::string& targetDir) override;
+
+    binder::Status destroyDsuMetadataKey(const std::string& dsuSlot) override;
 };
 
 }  // namespace vold

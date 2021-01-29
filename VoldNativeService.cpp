@@ -33,6 +33,8 @@
 #include "Checkpoint.h"
 #include "FsCrypt.h"
 #include "IdleMaint.h"
+#include "KeyStorage.h"
+#include "Keymaster.h"
 #include "MetadataCrypt.h"
 #include "MoveStorage.h"
 #include "Process.h"
@@ -281,12 +283,6 @@ binder::Status VoldNativeService::mount(
         return translate(res);
     }
 
-    if ((mountFlags & MOUNT_FLAG_PRIMARY) != 0) {
-        res = VolumeManager::Instance()->setPrimary(vol);
-        if (res != OK) {
-            return translate(res);
-        }
-    }
     return translate(OK);
 }
 
@@ -382,7 +378,17 @@ binder::Status VoldNativeService::remountAppStorageDirs(int uid, int pid,
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_LOCK;
 
-    return translate(VolumeManager::Instance()->remountAppStorageDirs(uid, pid, packageNames));
+    return translate(VolumeManager::Instance()->handleAppStorageDirs(uid, pid,
+            false /* doUnmount */, packageNames));
+}
+
+binder::Status VoldNativeService::unmountAppStorageDirs(int uid, int pid,
+        const std::vector<std::string>& packageNames) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    return translate(VolumeManager::Instance()->handleAppStorageDirs(uid, pid,
+            true /* doUnmount */, packageNames));
 }
 
 binder::Status VoldNativeService::setupAppDir(const std::string& path, int32_t appUid) {
@@ -391,6 +397,14 @@ binder::Status VoldNativeService::setupAppDir(const std::string& path, int32_t a
     ACQUIRE_LOCK;
 
     return translate(VolumeManager::Instance()->setupAppDir(path, appUid));
+}
+
+binder::Status VoldNativeService::ensureAppDirsCreated(const std::vector<std::string>& paths,
+        int32_t appUid) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    return translate(VolumeManager::Instance()->ensureAppDirsCreated(paths, appUid));
 }
 
 binder::Status VoldNativeService::fixupAppDir(const std::string& path, int32_t appUid) {
@@ -672,15 +686,25 @@ binder::Status VoldNativeService::mountFstab(const std::string& blkDevice,
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_LOCK;
 
-    return translateBool(fscrypt_mount_metadata_encrypted(blkDevice, mountPoint, false));
+    return translateBool(
+            fscrypt_mount_metadata_encrypted(blkDevice, mountPoint, false, false, "null"));
 }
 
 binder::Status VoldNativeService::encryptFstab(const std::string& blkDevice,
-                                               const std::string& mountPoint) {
+                                               const std::string& mountPoint, bool shouldFormat,
+                                               const std::string& fsType) {
     ENFORCE_SYSTEM_OR_ROOT;
     ACQUIRE_LOCK;
 
-    return translateBool(fscrypt_mount_metadata_encrypted(blkDevice, mountPoint, true));
+    return translateBool(
+            fscrypt_mount_metadata_encrypted(blkDevice, mountPoint, true, shouldFormat, fsType));
+}
+
+binder::Status VoldNativeService::setStorageBindingSeed(const std::vector<uint8_t>& seed) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_CRYPT_LOCK;
+
+    return translateBool(setKeyStorageBindingSeed(seed));
 }
 
 binder::Status VoldNativeService::createUserKey(int32_t userId, int32_t userSerial,
@@ -879,6 +903,14 @@ binder::Status VoldNativeService::resetCheckpoint() {
     return Ok();
 }
 
+binder::Status VoldNativeService::earlyBootEnded() {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    Keymaster::earlyBootEnded();
+    return Ok();
+}
+
 binder::Status VoldNativeService::incFsEnabled(bool* _aidl_return) {
     ENFORCE_SYSTEM_OR_ROOT;
 
@@ -948,6 +980,13 @@ binder::Status VoldNativeService::bindMount(const std::string& sourceDir,
     CHECK_ARGUMENT_PATH(targetDir);
 
     return translate(incfs::bindMount(sourceDir, targetDir));
+}
+
+binder::Status VoldNativeService::destroyDsuMetadataKey(const std::string& dsuSlot) {
+    ENFORCE_SYSTEM_OR_ROOT;
+    ACQUIRE_LOCK;
+
+    return translateBool(destroy_dsu_metadata_key(dsuSlot));
 }
 
 }  // namespace vold

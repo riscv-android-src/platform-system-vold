@@ -19,7 +19,9 @@
 
 #include "KeyBuffer.h"
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace android {
 namespace vold {
@@ -61,8 +63,7 @@ bool storeKeyAtomically(const std::string& key_path, const std::string& tmp_path
                         const KeyAuthentication& auth, const KeyBuffer& key);
 
 // Retrieve the key from the named directory.
-bool retrieveKey(const std::string& dir, const KeyAuthentication& auth, KeyBuffer* key,
-                 bool keepOld = false);
+bool retrieveKey(const std::string& dir, const KeyAuthentication& auth, KeyBuffer* key);
 
 // Securely destroy the key stored in the named directory and delete the directory.
 bool destroyKey(const std::string& dir);
@@ -73,6 +74,9 @@ bool runSecdiscardSingle(const std::string& file);
 bool generateWrappedStorageKey(KeyBuffer* key);
 // Export the per-boot boot wrapped storage key using keymaster.
 bool exportWrappedStorageKey(const KeyBuffer& kmKey, KeyBuffer* key);
+
+// Set a seed to be mixed into all key storage encryption keys.
+bool setKeyStorageBindingSeed(const std::vector<uint8_t>& seed);
 }  // namespace vold
 }  // namespace android
 
