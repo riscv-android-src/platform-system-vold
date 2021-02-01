@@ -34,7 +34,6 @@ struct DIR;
 namespace android {
 namespace vold {
 
-static const char* kPropFuse = "persist.sys.fuse";
 static const char* kVoldAppDataIsolationEnabled = "persist.sys.vold_app_data_isolation_enabled";
 static const char* kExternalStorageSdcardfs = "external_storage.sdcardfs.enabled";
 
@@ -51,6 +50,9 @@ std::string GetFuseMountPathForUser(userid_t user_id, const std::string& relativ
 
 status_t CreateDeviceNode(const std::string& path, dev_t dev);
 status_t DestroyDeviceNode(const std::string& path);
+
+status_t SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
+                       std::vector<gid_t> additionalGids);
 
 status_t AbortFuseConnections();
 
