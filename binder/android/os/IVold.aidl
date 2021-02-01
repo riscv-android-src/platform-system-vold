@@ -54,9 +54,11 @@ interface IVold {
 
     void remountUid(int uid, int remountMode);
     void remountAppStorageDirs(int uid, int pid, in @utf8InCpp String[] packageNames);
+    void unmountAppStorageDirs(int uid, int pid, in @utf8InCpp String[] packageNames);
 
     void setupAppDir(@utf8InCpp String path, int appUid);
     void fixupAppDir(@utf8InCpp String path, int appUid);
+    void ensureAppDirsCreated(in @utf8InCpp String[] paths, int appUid);
 
     @utf8InCpp String createObb(@utf8InCpp String sourcePath, @utf8InCpp String sourceKey,
                                 int ownerGid);
@@ -87,7 +89,9 @@ interface IVold {
     void initUser0();
     boolean isConvertibleToFbe();
     void mountFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint);
-    void encryptFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint);
+    void encryptFstab(@utf8InCpp String blkDevice, @utf8InCpp String mountPoint, boolean shouldFormat, @utf8InCpp String fsType);
+
+    void setStorageBindingSeed(in byte[] seed);
 
     void createUserKey(int userId, int userSerial, boolean ephemeral);
     void destroyUserKey(int userId);
@@ -167,7 +171,6 @@ interface IVold {
 
     const int STORAGE_FLAG_DE = 1;
     const int STORAGE_FLAG_CE = 2;
-    const int STORAGE_FLAG_LEVEL_FROM_USER = 4;
 
     const int REMOUNT_MODE_NONE = 0;
     const int REMOUNT_MODE_DEFAULT = 1;

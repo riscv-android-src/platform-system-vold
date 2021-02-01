@@ -74,6 +74,7 @@ using android::vold::KeyBuffer;
 using android::vold::KeyGeneration;
 using android::vold::retrieveKey;
 using android::vold::retrieveOrGenerateKey;
+using android::vold::SetDefaultAcl;
 using android::vold::SetQuotaInherit;
 using android::vold::SetQuotaProjectId;
 using android::vold::writeStringToFile;
@@ -794,11 +795,6 @@ bool fscrypt_lock_user_key(userid_t user_id) {
 
 static bool prepare_subdirs(const std::string& action, const std::string& volume_uuid,
                             userid_t user_id, int flags) {
-    // TODO(b/141677108): Remove this & make it the default behavior
-    if (android::base::GetProperty("ro.vold.level_from_user", "0") == "1") {
-        flags |= android::os::IVold::STORAGE_FLAG_LEVEL_FROM_USER;
-    }
-
     if (0 != android::vold::ForkExecvp(
                  std::vector<std::string>{prepare_subdirs_path, action, volume_uuid,
                                           std::to_string(user_id), std::to_string(flags)})) {
@@ -867,7 +863,15 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
             if (!prepare_dir(misc_ce_path, 01771, AID_SYSTEM, AID_MISC)) return false;
             if (!prepare_dir(vendor_ce_path, 0771, AID_ROOT, AID_ROOT)) return false;
         }
-        if (!prepare_dir(media_ce_path, 0770, AID_MEDIA_RW, AID_MEDIA_RW)) return false;
+        if (!prepare_dir(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW)) return false;
+        // On devices without sdcardfs (kernel 5.4+), the path permissions aren't fixed
+        // up automatically; therefore, use a default ACL, to ensure apps with MEDIA_RW
+        // can keep reading external storage; in particular, this allows app cloning
+        // scenarios to work correctly on such devices.
+        int ret = SetDefaultAcl(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW, {AID_MEDIA_RW});
+        if (ret != android::OK) {
+            return false;
+        }
 
         if (!prepare_dir(user_ce_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
