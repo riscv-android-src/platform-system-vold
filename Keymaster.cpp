@@ -21,6 +21,7 @@
 #include <aidl/android/hardware/security/keymint/SecurityLevel.h>
 #include <aidl/android/security/maintenance/IKeystoreMaintenance.h>
 #include <aidl/android/system/keystore2/Domain.h>
+#include <aidl/android/system/keystore2/EphemeralStorageKeyResponse.h>
 #include <aidl/android/system/keystore2/KeyDescriptor.h>
 
 // Keep these in sync with system/security/keystore2/src/keystore2_main.rs
@@ -81,14 +82,7 @@ bool KeymasterOperation::updateCompletely(const char* input, size_t inputLen,
             ks2Operation = nullptr;
             return false;
         }
-
-        if (!output) {
-            LOG(ERROR) << "Keystore2 operation update didn't return output.";
-            ks2Operation = nullptr;
-            return false;
-        }
-
-        consumer((const char*)output->data(), output->size());
+        if (output) consumer((const char*)output->data(), output->size());
     }
     return true;
 }
@@ -110,7 +104,7 @@ bool KeymasterOperation::finish(std::string* output) {
 }
 
 Keymaster::Keymaster() {
-    ::ndk::SpAIBinder binder(AServiceManager_getService(keystore2_service_name));
+    ::ndk::SpAIBinder binder(AServiceManager_waitForService(keystore2_service_name));
     auto keystore2Service = ks2::IKeystoreService::fromBinder(binder);
 
     if (!keystore2Service) {
@@ -164,15 +158,19 @@ bool Keymaster::exportKey(const KeyBuffer& kmKey, std::string* key) {
             .nspace = VOLD_NAMESPACE,
     };
     storageKey.blob = std::make_optional<std::vector<uint8_t>>(kmKey.begin(), kmKey.end());
-    std::vector<uint8_t> ephemeral_key;
-    auto rc = securityLevel->convertStorageKeyToEphemeral(storageKey, &ephemeral_key);
+    ks2::EphemeralStorageKeyResponse ephemeral_key_response;
+    auto rc = securityLevel->convertStorageKeyToEphemeral(storageKey, &ephemeral_key_response);
 
     if (logKeystore2ExceptionIfPresent(rc, "exportKey")) goto out;
-    if (key) *key = std::string(ephemeral_key.begin(), ephemeral_key.end());
+    if (key)
+        *key = std::string(ephemeral_key_response.ephemeralKey.begin(),
+                           ephemeral_key_response.ephemeralKey.end());
+
+    // TODO b/185811713 store the upgraded key blob if provided and delete the old key blob.
 
     ret = true;
 out:
-    zeroize_vector(ephemeral_key);
+    zeroize_vector(ephemeral_key_response.ephemeralKey);
     zeroize_vector(storageKey.blob.value());
     return ret;
 }
