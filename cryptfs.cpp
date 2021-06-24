@@ -22,13 +22,14 @@
 #include "CryptoType.h"
 #include "EncryptInplace.h"
 #include "FsCrypt.h"
-#include "Keymaster.h"
+#include "Keystore.h"
 #include "Process.h"
 #include "ScryptParameters.h"
 #include "Utils.h"
 #include "VoldUtil.h"
 #include "VolumeManager.h"
 
+#include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
@@ -80,6 +81,7 @@ using android::fs_mgr::GetEntryForMountPoint;
 using android::vold::CryptoType;
 using android::vold::KeyBuffer;
 using android::vold::KeyGeneration;
+using namespace android::vold;
 using namespace android::dm;
 using namespace std::chrono_literals;
 
@@ -254,8 +256,6 @@ struct crypt_persist_data {
     struct crypt_persist_entry persist_entry[0];
 };
 
-static int wait_and_unmount(const char* mountpoint, bool kill);
-
 typedef int (*kdf_func)(const char* passwd, const unsigned char* salt, unsigned char* ikey,
                         void* params);
 
@@ -326,9 +326,43 @@ const KeyGeneration cryptfs_get_keygen() {
     return KeyGeneration{get_crypto_type().get_keysize(), true, false};
 }
 
-/* Should we use keymaster? */
-static int keymaster_check_compatibility() {
-    return keymaster_compatibility_cryptfs_scrypt();
+static bool write_string_to_buf(const std::string& towrite, uint8_t* buffer, uint32_t buffer_size,
+                                uint32_t* out_size) {
+    if (!buffer || !out_size) {
+        LOG(ERROR) << "Missing target pointers";
+        return false;
+    }
+    *out_size = towrite.size();
+    if (buffer_size < towrite.size()) {
+        LOG(ERROR) << "Buffer too small " << buffer_size << " < " << towrite.size();
+        return false;
+    }
+    memset(buffer, '\0', buffer_size);
+    std::copy(towrite.begin(), towrite.end(), buffer);
+    return true;
+}
+
+static int keymaster_create_key_for_cryptfs_scrypt(uint32_t rsa_key_size, uint64_t rsa_exponent,
+                                                   uint32_t ratelimit, uint8_t* key_buffer,
+                                                   uint32_t key_buffer_size,
+                                                   uint32_t* key_out_size) {
+    if (key_out_size) {
+        *key_out_size = 0;
+    }
+    Keystore dev;
+    if (!dev) {
+        LOG(ERROR) << "Failed to initiate keymaster session";
+        return -1;
+    }
+    auto keyParams = km::AuthorizationSetBuilder()
+                             .RsaSigningKey(rsa_key_size, rsa_exponent)
+                             .NoDigestOrPadding()
+                             .Authorization(km::TAG_NO_AUTH_REQUIRED)
+                             .Authorization(km::TAG_MIN_SECONDS_BETWEEN_OPS, ratelimit);
+    std::string key;
+    if (!dev.generateKey(keyParams, &key)) return -1;
+    if (!write_string_to_buf(key, key_buffer, key_buffer_size, key_out_size)) return -1;
+    return 0;
 }
 
 /* Create a new keymaster key and store it in this footer */
@@ -349,6 +383,79 @@ static int keymaster_create_key(struct crypt_mnt_ftr* ftr) {
         SLOGE("Failed to generate keypair");
         return -1;
     }
+    return 0;
+}
+
+static int keymaster_sign_object_for_cryptfs_scrypt(struct crypt_mnt_ftr* ftr, uint32_t ratelimit,
+                                                    const uint8_t* object, const size_t object_size,
+                                                    uint8_t** signature_buffer,
+                                                    size_t* signature_buffer_size) {
+    if (!object || !signature_buffer || !signature_buffer_size) {
+        LOG(ERROR) << __FILE__ << ":" << __LINE__ << ":Invalid argument";
+        return -1;
+    }
+
+    Keystore dev;
+    if (!dev) {
+        LOG(ERROR) << "Failed to initiate keymaster session";
+        return -1;
+    }
+
+    km::AuthorizationSet outParams;
+    std::string key(reinterpret_cast<const char*>(ftr->keymaster_blob), ftr->keymaster_blob_size);
+    std::string input(reinterpret_cast<const char*>(object), object_size);
+    std::string output;
+    KeystoreOperation op;
+
+    auto paramBuilder = km::AuthorizationSetBuilder().NoDigestOrPadding().Authorization(
+            km::TAG_PURPOSE, km::KeyPurpose::SIGN);
+    while (true) {
+        op = dev.begin(key, paramBuilder, &outParams);
+        if (op.getErrorCode() == km::ErrorCode::KEY_RATE_LIMIT_EXCEEDED) {
+            sleep(ratelimit);
+            continue;
+        } else
+            break;
+    }
+
+    if (!op) {
+        LOG(ERROR) << "Error starting keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    if (op.getUpgradedBlob()) {
+        write_string_to_buf(*op.getUpgradedBlob(), ftr->keymaster_blob, KEYMASTER_BLOB_SIZE,
+                            &ftr->keymaster_blob_size);
+
+        SLOGD("Upgrading key");
+        if (put_crypt_ftr_and_key(ftr) != 0) {
+            SLOGE("Failed to write upgraded key to disk");
+            return -1;
+        }
+        SLOGD("Key upgraded successfully");
+    }
+
+    if (!op.updateCompletely(input, &output)) {
+        LOG(ERROR) << "Error sending data to keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    if (!op.finish(&output)) {
+        LOG(ERROR) << "Error finalizing keymaster signature transaction: "
+                   << int32_t(op.getErrorCode());
+        return -1;
+    }
+
+    *signature_buffer = reinterpret_cast<uint8_t*>(malloc(output.size()));
+    if (*signature_buffer == nullptr) {
+        LOG(ERROR) << "Error allocation buffer for keymaster signature";
+        return -1;
+    }
+    *signature_buffer_size = output.size();
+    std::copy(output.data(), output.data() + output.size(), *signature_buffer);
+
     return 0;
 }
 
@@ -389,31 +496,8 @@ static int keymaster_sign_object(struct crypt_mnt_ftr* ftr, const unsigned char*
             SLOGE("Unknown KDF type %d", ftr->kdf_type);
             return -1;
     }
-    for (;;) {
-        auto result = keymaster_sign_object_for_cryptfs_scrypt(
-            ftr->keymaster_blob, ftr->keymaster_blob_size, KEYMASTER_CRYPTFS_RATE_LIMIT, to_sign,
-            to_sign_size, signature, signature_size);
-        switch (result) {
-            case KeymasterSignResult::ok:
-                return 0;
-            case KeymasterSignResult::upgrade:
-                break;
-            default:
-                return -1;
-        }
-        SLOGD("Upgrading key");
-        if (keymaster_upgrade_key_for_cryptfs_scrypt(
-                RSA_KEY_SIZE, RSA_EXPONENT, KEYMASTER_CRYPTFS_RATE_LIMIT, ftr->keymaster_blob,
-                ftr->keymaster_blob_size, ftr->keymaster_blob, KEYMASTER_BLOB_SIZE,
-                &ftr->keymaster_blob_size) != 0) {
-            SLOGE("Failed to upgrade key");
-            return -1;
-        }
-        if (put_crypt_ftr_and_key(ftr) != 0) {
-            SLOGE("Failed to write upgraded key to disk");
-        }
-        SLOGD("Key upgraded successfully");
-    }
+    return keymaster_sign_object_for_cryptfs_scrypt(ftr, KEYMASTER_CRYPTFS_RATE_LIMIT, to_sign,
+                                                    to_sign_size, signature, signature_size);
 }
 
 /* Store password when userdata is successfully decrypted and mounted.
@@ -1424,20 +1508,24 @@ static void ensure_subdirectory_unmounted(const char *prefix) {
         [](const std::string& s1, const std::string& s2) {return s1.length() > s2.length(); });
 
     for (std::string& mount_point : umount_points) {
-        umount(mount_point.c_str());
-        SLOGW("umount sub-directory mount %s\n", mount_point.c_str());
+        SLOGW("unmounting sub-directory mount %s\n", mount_point.c_str());
+        if (umount(mount_point.c_str()) != 0) {
+            SLOGE("unmounting %s failed: %s\n", mount_point.c_str(), strerror(errno));
+        }
     }
 }
 
-static int wait_and_unmount(const char* mountpoint, bool kill) {
+static int wait_and_unmount(const char* mountpoint) {
     int i, err, rc;
 
-    // Subdirectory mount will cause a failure of umount.
-    ensure_subdirectory_unmounted(mountpoint);
 #define WAIT_UNMOUNT_COUNT 20
 
     /*  Now umount the tmpfs filesystem */
     for (i = 0; i < WAIT_UNMOUNT_COUNT; i++) {
+        // Subdirectory mount will cause a failure of umount.
+        ensure_subdirectory_unmounted(mountpoint);
+
+        SLOGD("unmounting mount %s\n", mountpoint);
         if (umount(mountpoint) == 0) {
             break;
         }
@@ -1446,20 +1534,26 @@ static int wait_and_unmount(const char* mountpoint, bool kill) {
             /* EINVAL is returned if the directory is not a mountpoint,
              * i.e. there is no filesystem mounted there.  So just get out.
              */
+            SLOGD("%s is not a mountpoint, nothing to do\n", mountpoint);
             break;
         }
 
         err = errno;
+        SLOGW("unmounting mount %s failed: %s\n", mountpoint, strerror(err));
 
-        /* If allowed, be increasingly aggressive before the last two retries */
-        if (kill) {
-            if (i == (WAIT_UNMOUNT_COUNT - 3)) {
-                SLOGW("sending SIGHUP to processes with open files\n");
-                android::vold::KillProcessesWithOpenFiles(mountpoint, SIGTERM);
-            } else if (i == (WAIT_UNMOUNT_COUNT - 2)) {
-                SLOGW("sending SIGKILL to processes with open files\n");
-                android::vold::KillProcessesWithOpenFiles(mountpoint, SIGKILL);
-            }
+        // If it's taking too long, kill the processes with open files.
+        //
+        // Originally this logic was only a fail-safe, but now it's relied on to
+        // kill certain processes that aren't stopped by init because they
+        // aren't in the main or late_start classes.  So to avoid waiting for
+        // too long, we now are fairly aggressive in starting to kill processes.
+        static_assert(WAIT_UNMOUNT_COUNT >= 4);
+        if (i == 2) {
+            SLOGW("sending SIGTERM to processes with open files\n");
+            android::vold::KillProcessesWithOpenFiles(mountpoint, SIGTERM);
+        } else if (i >= 3) {
+            SLOGW("sending SIGKILL to processes with open files\n");
+            android::vold::KillProcessesWithOpenFiles(mountpoint, SIGKILL);
         }
 
         sleep(1);
@@ -1469,8 +1563,8 @@ static int wait_and_unmount(const char* mountpoint, bool kill) {
         SLOGD("unmounting %s succeeded\n", mountpoint);
         rc = 0;
     } else {
+        SLOGE("too many retries -- giving up unmounting %s\n", mountpoint);
         android::vold::KillProcessesWithOpenFiles(mountpoint, 0);
-        SLOGE("unmounting %s failed: %s\n", mountpoint, strerror(err));
         rc = -1;
     }
 
@@ -1593,7 +1687,7 @@ static int cryptfs_restart_internal(int restart_main) {
         return -1;
     }
 
-    if (!(rc = wait_and_unmount(DATA_MNT_POINT, true))) {
+    if (!(rc = wait_and_unmount(DATA_MNT_POINT))) {
         /* If ro.crypto.readonly is set to 1, mount the decrypted
          * filesystem readonly.  This is used when /data is mounted by
          * recovery mode.
@@ -1743,7 +1837,6 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr, const char* 
     char tmp_mount_point[64];
     unsigned int orig_failed_decrypt_count;
     int rc;
-    int use_keymaster = 0;
     int upgrade = 0;
     unsigned char* intermediate_key = 0;
     size_t intermediate_key_size = 0;
@@ -1825,14 +1918,8 @@ static int test_mount_encrypted_fs(struct crypt_mnt_ftr* crypt_ftr, const char* 
         rc = 0;
 
         // Upgrade if we're not using the latest KDF.
-        use_keymaster = keymaster_check_compatibility();
-        if (crypt_ftr->kdf_type == KDF_SCRYPT_KEYMASTER) {
-            // Don't allow downgrade
-        } else if (use_keymaster == 1 && crypt_ftr->kdf_type != KDF_SCRYPT_KEYMASTER) {
+        if (crypt_ftr->kdf_type != KDF_SCRYPT_KEYMASTER) {
             crypt_ftr->kdf_type = KDF_SCRYPT_KEYMASTER;
-            upgrade = 1;
-        } else if (use_keymaster == 0 && crypt_ftr->kdf_type != KDF_SCRYPT) {
-            crypt_ftr->kdf_type = KDF_SCRYPT;
             upgrade = 1;
         }
 
@@ -2037,20 +2124,7 @@ static int cryptfs_init_crypt_mnt_ftr(struct crypt_mnt_ftr* ftr) {
     ftr->minor_version = CURRENT_MINOR_VERSION;
     ftr->ftr_size = sizeof(struct crypt_mnt_ftr);
     ftr->keysize = get_crypto_type().get_keysize();
-
-    switch (keymaster_check_compatibility()) {
-        case 1:
-            ftr->kdf_type = KDF_SCRYPT_KEYMASTER;
-            break;
-
-        case 0:
-            ftr->kdf_type = KDF_SCRYPT;
-            break;
-
-        default:
-            SLOGE("keymaster_check_compatibility failed");
-            return -1;
-    }
+    ftr->kdf_type = KDF_SCRYPT_KEYMASTER;
 
     get_device_scrypt_params(ftr);
 
@@ -2172,7 +2246,7 @@ int cryptfs_enable_internal(int crypt_type, const char* passwd, int no_ui) {
          * /data, set a property saying we're doing inplace encryption,
          * and restart the framework.
          */
-        wait_and_unmount(DATA_MNT_POINT, true);
+        wait_and_unmount(DATA_MNT_POINT);
         if (fs_mgr_do_tmpfs_mount(DATA_MNT_POINT)) {
             goto error_shutting_down;
         }
