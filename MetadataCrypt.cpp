@@ -38,7 +38,7 @@
 #include "EncryptInplace.h"
 #include "KeyStorage.h"
 #include "KeyUtil.h"
-#include "Keymaster.h"
+#include "Keystore.h"
 #include "Utils.h"
 #include "VoldUtil.h"
 #include "fs/Ext4.h"
@@ -49,6 +49,7 @@ namespace vold {
 
 using android::fs_mgr::FstabEntry;
 using android::fs_mgr::GetEntryForMountPoint;
+using android::fscrypt::GetFirstApiLevel;
 using android::vold::KeyBuffer;
 using namespace android::dm;
 
