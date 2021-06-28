@@ -22,7 +22,7 @@
 #include "CryptoType.h"
 #include "EncryptInplace.h"
 #include "FsCrypt.h"
-#include "Keymaster.h"
+#include "Keystore.h"
 #include "Process.h"
 #include "ScryptParameters.h"
 #include "Utils.h"
@@ -349,7 +349,7 @@ static int keymaster_create_key_for_cryptfs_scrypt(uint32_t rsa_key_size, uint64
     if (key_out_size) {
         *key_out_size = 0;
     }
-    Keymaster dev;
+    Keystore dev;
     if (!dev) {
         LOG(ERROR) << "Failed to initiate keymaster session";
         return -1;
@@ -395,7 +395,7 @@ static int keymaster_sign_object_for_cryptfs_scrypt(struct crypt_mnt_ftr* ftr, u
         return -1;
     }
 
-    Keymaster dev;
+    Keystore dev;
     if (!dev) {
         LOG(ERROR) << "Failed to initiate keymaster session";
         return -1;
@@ -405,7 +405,7 @@ static int keymaster_sign_object_for_cryptfs_scrypt(struct crypt_mnt_ftr* ftr, u
     std::string key(reinterpret_cast<const char*>(ftr->keymaster_blob), ftr->keymaster_blob_size);
     std::string input(reinterpret_cast<const char*>(object), object_size);
     std::string output;
-    KeymasterOperation op;
+    KeystoreOperation op;
 
     auto paramBuilder = km::AuthorizationSetBuilder().NoDigestOrPadding().Authorization(
             km::TAG_PURPOSE, km::KeyPurpose::SIGN);
@@ -1508,20 +1508,24 @@ static void ensure_subdirectory_unmounted(const char *prefix) {
         [](const std::string& s1, const std::string& s2) {return s1.length() > s2.length(); });
 
     for (std::string& mount_point : umount_points) {
-        umount(mount_point.c_str());
-        SLOGW("umount sub-directory mount %s\n", mount_point.c_str());
+        SLOGW("unmounting sub-directory mount %s\n", mount_point.c_str());
+        if (umount(mount_point.c_str()) != 0) {
+            SLOGE("unmounting %s failed: %s\n", mount_point.c_str(), strerror(errno));
+        }
     }
 }
 
 static int wait_and_unmount(const char* mountpoint) {
     int i, err, rc;
 
-    // Subdirectory mount will cause a failure of umount.
-    ensure_subdirectory_unmounted(mountpoint);
 #define WAIT_UNMOUNT_COUNT 20
 
     /*  Now umount the tmpfs filesystem */
     for (i = 0; i < WAIT_UNMOUNT_COUNT; i++) {
+        // Subdirectory mount will cause a failure of umount.
+        ensure_subdirectory_unmounted(mountpoint);
+
+        SLOGD("unmounting mount %s\n", mountpoint);
         if (umount(mountpoint) == 0) {
             break;
         }
@@ -1530,10 +1534,12 @@ static int wait_and_unmount(const char* mountpoint) {
             /* EINVAL is returned if the directory is not a mountpoint,
              * i.e. there is no filesystem mounted there.  So just get out.
              */
+            SLOGD("%s is not a mountpoint, nothing to do\n", mountpoint);
             break;
         }
 
         err = errno;
+        SLOGW("unmounting mount %s failed: %s\n", mountpoint, strerror(err));
 
         // If it's taking too long, kill the processes with open files.
         //
@@ -1557,8 +1563,8 @@ static int wait_and_unmount(const char* mountpoint) {
         SLOGD("unmounting %s succeeded\n", mountpoint);
         rc = 0;
     } else {
+        SLOGE("too many retries -- giving up unmounting %s\n", mountpoint);
         android::vold::KillProcessesWithOpenFiles(mountpoint, 0);
-        SLOGE("unmounting %s failed: %s\n", mountpoint, strerror(err));
         rc = -1;
     }
 
