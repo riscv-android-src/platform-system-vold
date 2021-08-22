@@ -38,7 +38,7 @@
 #include "EncryptInplace.h"
 #include "KeyStorage.h"
 #include "KeyUtil.h"
-#include "Keymaster.h"
+#include "Keystore.h"
 #include "Utils.h"
 #include "VoldUtil.h"
 #include "fs/Ext4.h"
@@ -49,6 +49,7 @@ namespace vold {
 
 using android::fs_mgr::FstabEntry;
 using android::fs_mgr::GetEntryForMountPoint;
+using android::fscrypt::GetFirstApiLevel;
 using android::vold::KeyBuffer;
 using namespace android::dm;
 
@@ -112,6 +113,17 @@ static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& g
     auto dir = metadata_key_dir + "/key";
     LOG(DEBUG) << "metadata_key_dir/key: " << dir;
     if (!MkdirsSync(dir, 0700)) return false;
+    if (!pathExists(dir)) {
+        auto delete_all = android::base::GetBoolProperty(
+                "ro.crypto.metadata_init_delete_all_keys.enabled", false);
+        if (delete_all) {
+            LOG(INFO) << "Metadata key does not exist, calling deleteAllKeys";
+            Keystore::deleteAllKeys();
+        } else {
+            LOG(DEBUG) << "Metadata key does not exist but "
+                          "ro.crypto.metadata_init_delete_all_keys.enabled is false";
+        }
+    }
     auto temp = metadata_key_dir + "/tmp";
     return retrieveOrGenerateKey(dir, temp, kEmptyAuthentication, gen, key);
 }
